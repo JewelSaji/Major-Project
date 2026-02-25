@@ -51,7 +51,8 @@ def main():
         ("Model Training & Calibration", "03_train.py"),
         ("Embedding Diagnostics", "04_diagnose.py"),
         ("SHAP Interpretability", "05_analyze.py"),
-        ("Journal Visualizations", "06_visualize.py")
+        ("Journal Visualizations", "06_visualize.py"),
+        ("Cross-Paper Model Comparison", "09_compare_models.py"),
     ]
     
     total_start = time.time()

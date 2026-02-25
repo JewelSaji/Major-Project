@@ -55,8 +55,26 @@ class SHAPAnalyzer:
         # ── FIX: pkl stores list of (name, model) tuples under 'models', not 'model'
         self.primary_model = _extract_primary_model(self.model_data)
 
-        # Load fused data
-        tabular = pd.read_csv(FEATURES_CSV, low_memory=False)
+        # Load data — prefer pruned CSV to avoid OOM on the 400MB full file
+        features = self.model_data["features"]
+        pruned_path = FEATURES_CSV.replace(".csv", "_pruned.csv")
+        csv_path = pruned_path if os.path.exists(pruned_path) else FEATURES_CSV
+
+        # Only load columns the model actually needs (+ hadm_id)
+        tab_features = [f for f in features if not f.startswith("ct5_")]
+        use_cols = list(set(["hadm_id", "readmit_30"] + tab_features))
+
+        try:
+            tabular = pd.read_csv(csv_path, usecols=lambda c: c in use_cols,
+                                  low_memory=False)
+        except Exception:
+            # Last resort: read in chunks and concat
+            chunks = []
+            for chunk in pd.read_csv(csv_path, chunksize=50_000, low_memory=False):
+                keep = [c for c in use_cols if c in chunk.columns]
+                chunks.append(chunk[keep])
+            tabular = pd.concat(chunks, ignore_index=True)
+
         if os.path.exists(EMBEDDINGS_CSV):
             embs    = pd.read_csv(EMBEDDINGS_CSV)
             self.df = tabular.merge(embs, on="hadm_id", how="left").fillna(0)

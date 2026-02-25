@@ -26,12 +26,14 @@ except ImportError:
 try:
     from .config import FIGURES_DIR, RESULTS_DIR, MAIN_MODEL_PKL, FEATURES_CSV
     from .embedding_utils import _extract_primary_model
+    from .plot_style import apply_publication_style, save_publication_figure
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from config import FIGURES_DIR, RESULTS_DIR, MAIN_MODEL_PKL, FEATURES_CSV
     from embedding_utils import _extract_primary_model
+    from plot_style import apply_publication_style, save_publication_figure
 
-plt.rcParams.update({"font.size": 10, "axes.labelsize": 11, "axes.titlesize": 12})
+apply_publication_style()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -75,16 +77,14 @@ class JournalVisualizer:
         if HAS_SEABORN:
             import seaborn as sns
             sns.barplot(data=df_imp, x="importance", y="feature",
-                        palette="viridis", ax=ax)
+                        hue="feature", palette="viridis", legend=False, ax=ax)
         else:
             ax.barh(df_imp["feature"][::-1], df_imp["importance"][::-1])
 
         ax.set_title(f"Top {top_n} Predictive Clinical Features (LightGBM gain)")
         ax.set_xlabel("Feature Importance")
-        plt.tight_layout()
         out = os.path.join(self.journal_dir, "fig_feature_importance.png")
-        plt.savefig(out, dpi=300)
-        plt.close()
+        save_publication_figure(fig, out)
         logger.info("Feature importance plot saved -> %s", out)
 
     # ── Plot 2: Training results from JSON ────────────────────────────────────
@@ -116,10 +116,8 @@ class JournalVisualizer:
         for bar, val in zip(bars, metrics.values()):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f"{val:.3f}", ha="center", va="bottom", fontsize=9)
-        plt.tight_layout()
         out = os.path.join(self.journal_dir, "fig_results_summary.png")
-        plt.savefig(out, dpi=300)
-        plt.close()
+        save_publication_figure(fig, out)
         logger.info("Results summary plot saved -> %s", out)
 
     # ── Plot 3: Ablation comparison ───────────────────────────────────────────
@@ -144,10 +142,8 @@ class JournalVisualizer:
         ax.set_ylabel("AUROC")
         for i, (k, v) in enumerate(ablation.items()):
             ax.text(i, v + 0.002, f"{v:.4f}", ha="center", fontsize=9)
-        plt.tight_layout()
         out = os.path.join(self.journal_dir, "fig_ablation.png")
-        plt.savefig(out, dpi=300)
-        plt.close()
+        save_publication_figure(fig, out)
         logger.info("Ablation plot saved -> %s", out)
 
     def run(self):

@@ -1,8 +1,6 @@
 # Data and Models
 data/
-models/*.pkl
-models/*.pth
-models/*.bin
+models/
 results/
 figures/
 !figures/journal/
@@ -27,3 +25,19 @@ api_pid.txt
 importance_check.json
 results_check.json
 embeddings_check.json
+large_files.txt
+
+# Binary and Library files
+*.dll
+*.so
+*.exe
+*.lib
+*.bin
+*.pt
+*.pth
+*.joblib
+*.pkl
+*.parquet
+*.csv
+*.tsv
+*.log

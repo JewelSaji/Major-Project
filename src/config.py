@@ -48,8 +48,12 @@ BATCH_SIZE_CPU = 8
 RANDOM_STATE = 42
 
 # 30-Day Readmission Thresholds
-THRESHOLD_HIGH_RISK = 0.5
-THRESHOLD_MEDIUM_RISK = 0.3
+THRESHOLD_HIGH_RISK = 0.7
+THRESHOLD_MEDIUM_RISK = 0.4
+
+# Training toggles
+# Set False to disable SMOTETomek oversampling in 03_train.py
+ENABLE_SMOTE = False
 
 # ========================================
 # 3. FEATURE DEFAULTS

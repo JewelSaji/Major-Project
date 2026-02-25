@@ -25,6 +25,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Match 02_embed.py chunking defaults so inference embeddings follow training logic.
+CHUNK_WORDS = 220
+CHUNK_OVERLAP = 40
+MAX_CHUNKS_PER_NOTE = 6
+BIOCLINICALBERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
+
 # ── Config import (works both as package and as direct script) ─────────────────
 try:
     from .config import (
@@ -81,6 +87,35 @@ class ClinicalNoteChunker:
         return chunks or [text]
 
 
+def _note_chunks_for_inference(text: str) -> list:
+    """Replicate chunked note pooling used by 02_embed.py."""
+    if not text or len(text.strip()) == 0:
+        return ["[NO_NOTE]"]
+    words = text.split()
+    if not words:
+        return ["[NO_NOTE]"]
+    chunks = []
+    step = max(CHUNK_WORDS - CHUNK_OVERLAP, 1)
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + CHUNK_WORDS]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if len(chunks) >= MAX_CHUNKS_PER_NOTE:
+            break
+    return chunks or ["[NO_NOTE]"]
+
+
+def _raise_or_warn_embedding(strict: bool, message: str, err: Exception = None):
+    if strict:
+        if err is None:
+            raise RuntimeError(message)
+        raise RuntimeError(f"{message}: {err}") from err
+    if err is None:
+        logger.warning(message)
+    else:
+        logger.warning("%s (%s) — using zero vector.", message, err)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EMBEDDING GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,14 +140,19 @@ class EmbeddingGenerator:
         self._hf_tokenizer = None
         self.model_info: dict = self._load_model_info()
 
+    def _reset_hf_cache(self):
+        self._hf_model = None
+        self._hf_tokenizer = None
+
     # ── Info loading ──────────────────────────────────────────────────────────
 
     def _load_model_info(self) -> dict:
         if os.path.exists(self.model_info_path):
             try:
                 info = joblib.load(self.model_info_path)
+                model_ref = info.get("model_name") or info.get("model")
                 logger.info("Embedding info loaded: method=%s model=%s",
-                            info.get("method"), info.get("model_name"))
+                            info.get("method"), model_ref)
                 return info
             except Exception as e:
                 logger.warning("Could not load embedding_info.pkl: %s", e)
@@ -151,17 +191,29 @@ class EmbeddingGenerator:
         """
         Loads converted ClinicalT5 PyTorch weights (from Colab cell 7) and
         returns a 768-dim mean-pooled embedding.
+        If it fails, falls back to Bio_ClinicalBERT.
         """
-        from transformers import AutoTokenizer, T5EncoderModel
+        from transformers import AutoTokenizer, T5EncoderModel, AutoModel
         if self._hf_model is None:
             logger.info("Loading ClinicalT5 from %s ...", converted_dir)
             dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-            self._hf_tokenizer = AutoTokenizer.from_pretrained(converted_dir)
-            self._hf_model = T5EncoderModel.from_pretrained(
-                converted_dir,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).to(self.device).eval()
+            try:
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(converted_dir)
+                self._hf_model = T5EncoderModel.from_pretrained(
+                    converted_dir,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                ).to(self.device).eval()
+            except Exception as e:
+                logger.warning("Converted ClinicalT5 load failed: %s", e)
+                fallback_name = "emilyalsentzer/Bio_ClinicalBERT"
+                logger.info("Falling back to: %s", fallback_name)
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(fallback_name)
+                self._hf_model = AutoModel.from_pretrained(
+                    fallback_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                ).to(self.device).eval()
 
         tokens = self._hf_tokenizer(
             text,
@@ -178,14 +230,60 @@ class EmbeddingGenerator:
 
         return pooled.cpu().float().numpy()  # shape (1, 768)
 
+    def _embed_with_t5_hub(self, text: str, model_name: str) -> np.ndarray:
+        """
+        Load T5 encoder from HuggingFace hub with Flax fallback, mirroring 02_embed.py
+        where ClinicalT5 is loaded with from_flax=True, and falls back to Bio_ClinicalBERT.
+        """
+        from transformers import AutoTokenizer, T5EncoderModel, AutoModel
+        if self._hf_model is None:
+            logger.info("Loading T5 model from hub: %s", model_name)
+            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+            try:
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self._hf_model = T5EncoderModel.from_pretrained(
+                    model_name,
+                    from_flax=True,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                ).to(self.device).eval()
+            except Exception as e:
+                logger.warning("ClinicalT5 from Flax load failed: %s", e)
+                fallback_name = "emilyalsentzer/Bio_ClinicalBERT"
+                logger.info("Falling back to: %s", fallback_name)
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(fallback_name)
+                self._hf_model = AutoModel.from_pretrained(
+                    fallback_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                ).to(self.device).eval()
+
+        tokens = self._hf_tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=TEXT_MAX_LENGTH,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.no_grad():
+            hidden = self._hf_model(**tokens).last_hidden_state
+            mask = tokens["attention_mask"].unsqueeze(-1).float()
+            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+        return pooled.cpu().float().numpy()
+
     # ── HuggingFace fallback (Bio_ClinicalBERT etc.) ──────────────────────────
 
     def _embed_with_hf(self, text: str, model_name: str) -> np.ndarray:
         from transformers import AutoTokenizer, AutoModel
         if self._hf_model is None:
             logger.info("Loading HuggingFace model: %s", model_name)
+            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
             self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self._hf_model = AutoModel.from_pretrained(model_name).to(self.device).eval()
+            self._hf_model = AutoModel.from_pretrained(
+                model_name, torch_dtype=dtype, low_cpu_mem_usage=True
+            ).to(self.device).eval()
 
         tokens = self._hf_tokenizer(
             text, padding=True, truncation=True,
@@ -201,7 +299,7 @@ class EmbeddingGenerator:
 
     # ── Main inference entry point ────────────────────────────────────────────
 
-    def get_clinical_embedding(self, text: str = None, features: dict = None) -> np.ndarray:
+    def get_clinical_embedding(self, text: str = None, features: dict = None, strict: bool = False) -> np.ndarray:
         """
         Returns a 128-dim embedding vector matching what was used during training.
 
@@ -211,45 +309,94 @@ class EmbeddingGenerator:
           3. Apply stored PCA to compress to 128-dim
           4. If no PCA available, truncate/pad to EMBEDDING_DIM
         """
-        method     = self.model_info.get("method", "sentence_transformers")
-        model_name = self.model_info.get("model_name",
-                                         "sentence-transformers/all-mpnet-base-v2")
+        method = self.model_info.get("method", "sentence_transformers")
+        model_name = (
+            self.model_info.get("model_name")
+            or self.model_info.get("model")
+            or "sentence-transformers/all-mpnet-base-v2"
+        )
         pca        = self.model_info.get("pca")          # fitted sklearn PCA or None
         scaler     = self.model_info.get("scaler")       # optional StandardScaler
 
         raw_768: np.ndarray = None
+        note_chunks = _note_chunks_for_inference(text)
+        has_text = bool(text and text.strip())
 
         # ── Step 1: generate 768-dim raw embedding ────────────────────────
-        if text and text.strip():
+        if has_text:
             try:
                 if method == "sentence_transformers":
-                    raw_768 = self._embed_with_st(text, model_name)
+                    parts = [self._embed_with_st(chunk, model_name) for chunk in note_chunks]
+                    raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
 
-                elif method == "clinical_t5":
-                    converted_dir = self.model_info.get(
-                        "converted_dir", "clinical_t5_pytorch"
+                elif method in ("clinical_t5", "transformer_t5"):
+                    # 'transformer_t5' is the method name saved by 02_embed.py
+                    # when ClinicalT5/T5EncoderModel was used during training.
+                    # Try converted PyTorch dir first, then generic HuggingFace path.
+                    converted_dir = self.model_info.get("converted_dir")
+                    if converted_dir and os.path.exists(converted_dir):
+                        parts = [self._embed_with_clinical_t5(chunk, converted_dir) for chunk in note_chunks]
+                    else:
+                        # Fall back to loading directly from HuggingFace hub
+                        # (requires internet; model_name from embedding_info.pkl)
+                        logger.info(
+                            "No converted_dir found — loading %s from HuggingFace", model_name
+                        )
+                        parts = [self._embed_with_t5_hub(chunk, model_name) for chunk in note_chunks]
+                    raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
+
+                elif method == "huggingface" or str(method).startswith("transformer_"):
+                    parts = [self._embed_with_hf(chunk, model_name) for chunk in note_chunks]
+                    raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
+
+                elif method == "feature_svd":
+                    # SVD fallback used in 02_embed.py when all text models failed
+                    # — no text model involved, return zeros and rely on tabular features
+                    logger.warning(
+                        "Embedding method is 'feature_svd' (text model failed during "
+                        "training). Text note cannot improve prediction. Using zeros."
                     )
-                    raw_768 = self._embed_with_clinical_t5(text, converted_dir)
-
-                elif method == "huggingface":
-                    raw_768 = self._embed_with_hf(text, model_name)
+                    raw_768 = np.zeros((1, 768), dtype=np.float32)
 
                 else:
-                    # Unknown method — try sentence-transformers as safe default
+                    # Unknown method — try HuggingFace with stored model_name
                     logger.warning(
-                        "Unknown embedding method '%s', falling back to "
-                        "sentence-transformers/all-mpnet-base-v2", method
+                        "Unknown embedding method '%s' — attempting HuggingFace load "
+                        "of '%s'", method, model_name
                     )
-                    raw_768 = self._embed_with_st(
-                        text, "sentence-transformers/all-mpnet-base-v2"
-                    )
+                    try:
+                        parts = [self._embed_with_hf(chunk, model_name) for chunk in note_chunks]
+                        raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
+                    except Exception:
+                        raw_768 = np.zeros((1, 768), dtype=np.float32)
 
             except Exception as e:
                 logger.warning("Text embedding failed (%s) — using zero vector.", e)
                 raw_768 = np.zeros((1, 768), dtype=np.float32)
         else:
-            # No clinical note provided — zero vector (model trained on sparse text too)
-            raw_768 = np.zeros((1, 768), dtype=np.float32)
+            # No clinical note provided. Use dedicated token to stay consistent
+            # with training-time missing-note handling in 02_embed.py.
+            try:
+                if method == "sentence_transformers":
+                    raw_768 = self._embed_with_st("[NO_NOTE]", model_name)
+                elif method in ("clinical_t5", "transformer_t5"):
+                    converted_dir = self.model_info.get("converted_dir")
+                    if not converted_dir:
+                        local_converted = os.path.join(
+                            os.path.dirname(self.model_info_path), "clinical_t5_pytorch"
+                        )
+                        if os.path.exists(os.path.join(local_converted, "config.json")):
+                            converted_dir = local_converted
+                    if converted_dir and os.path.exists(converted_dir):
+                        raw_768 = self._embed_with_clinical_t5("[NO_NOTE]", converted_dir)
+                    else:
+                        raw_768 = self._embed_with_t5_hub("[NO_NOTE]", model_name)
+                elif method == "huggingface" or str(method).startswith("transformer_"):
+                    raw_768 = self._embed_with_hf("[NO_NOTE]", model_name)
+                else:
+                    raw_768 = np.zeros((1, 768), dtype=np.float32)
+            except Exception:
+                raw_768 = np.zeros((1, 768), dtype=np.float32)
 
         # ── Step 2: apply scaler + PCA (must match 02_embed.py exactly) ──
         if scaler is not None:
@@ -361,14 +508,16 @@ class ModelContainer:
         if not models:
             raise RuntimeError("No models found in pkl. Retrain first.")
 
-        X_arr = X.values.astype(np.float32)
+        # Keep DataFrame input to preserve feature names used during model fit.
+        # This avoids "X does not have valid feature names" warnings.
+        X_df = X.astype(np.float32)
 
         if meta is not None and len(models) > 1:
-            stack = np.column_stack([m.predict_proba(X_arr)[:, 1] for _, m in models])
+            stack = np.column_stack([m.predict_proba(X_df)[:, 1] for _, m in models])
             raw   = meta.predict_proba(stack)[:, 1]
         else:
             raw = np.mean(
-                [m.predict_proba(X_arr)[:, 1] for _, m in models], axis=0
+                [m.predict_proba(X_df)[:, 1] for _, m in models], axis=0
             )
 
         if calibrator is not None:

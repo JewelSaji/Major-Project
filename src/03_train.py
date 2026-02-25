@@ -67,6 +67,7 @@ from sklearn.metrics import (
     classification_report,
     f1_score,
     log_loss,
+    matthews_corrcoef,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
@@ -88,24 +89,44 @@ def _optuna_callback(study: "optuna.Study", trial: "optuna.trial.FrozenTrial") -
     """Log each completed trial so HPO progress is visible."""
     if trial.value is None:
         return  # failed trial
+    auc = trial.user_attrs.get("val_auroc", float("nan"))
+    ap  = trial.user_attrs.get("val_auprc", float("nan"))
     logger.info(
-        "  Trial %3d | AUROC: %.4f | best: %.4f | boosting: %-5s | leaves: %s | lr: %.4f",
+        "  Trial %3d | score: %.4f | best: %.4f | AUROC: %.4f | AUPRC: %.4f | boosting: %-5s | leaves: %s | lr: %.4f",
         trial.number,
         trial.value,
         study.best_value,
+        auc,
+        ap,
         trial.params.get("boosting_type", "?"),
         trial.params.get("num_leaves", "?"),
         trial.params.get("learning_rate", float("nan")),
     )
 
 
+def composite_rank_score(y_true: np.ndarray, probs: np.ndarray, alpha: Optional[float] = None) -> float:
+    """
+    Ranking-oriented objective used for tuning and blend selection.
+    Composite improves AUPRC without sacrificing AUROC.
+    """
+    if alpha is None:
+        alpha = HPO_ALPHA_AUPRC
+    auroc = roc_auc_score(y_true, probs)
+    auprc = average_precision_score(y_true, probs)
+    return float(alpha * auprc + (1.0 - alpha) * auroc)
+
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import (EMBEDDINGS_CSV, FEATURES_CSV, FIGURES_DIR,
-                         MAIN_MODEL_PKL, MODELS_DIR, RANDOM_STATE, RESULTS_DIR)
+    from .config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+                         FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+                         RANDOM_STATE, RESULTS_DIR)
+    from .plot_style import apply_publication_style, save_publication_figure
 except ImportError:
-    from config import (EMBEDDINGS_CSV, FEATURES_CSV, FIGURES_DIR,
-                        MAIN_MODEL_PKL, MODELS_DIR, RANDOM_STATE, RESULTS_DIR)
+    from config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+                        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+                        RANDOM_STATE, RESULTS_DIR)
+    from plot_style import apply_publication_style, save_publication_figure
 
 # Logging to both console and file
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -120,17 +141,29 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+apply_publication_style()
 
 SELECTED_FEATURES_JSON = os.path.join(MODELS_DIR, "selected_features.json")
 
 # -- TUNABLE CONSTANTS ----------------------------------------------------------
-OPTUNA_TRIALS = 5    # 50 trials ~ 2-3 hrs on GTX 3050 with 383k rows
+OPTUNA_TRIALS = 35    # AUROC-focused search; increase for better parameter fit
 N_FOLDS       = 5     # patient-level CV folds
 DART_MAX_TREES = 800  # cap dart trees — early stopping doesn't work with dart
-ENABLE_STACK  = True  # LightGBM + XGBoost meta-learner
-ENABLE_SMOTE  = True  # SMOTETomek oversampling (requires imbalanced-learn)
+ENABLE_STACK  = False  # Keep architecture aligned with ClinicalT5 + LightGBM
+ENABLE_SMOTE  = CFG_ENABLE_SMOTE  # SMOTETomek oversampling toggle from config.py
 TEST_FRAC     = 0.15  # fraction of patients in test set
 VAL_FRAC      = 0.15  # fraction of patients in validation set
+USE_TEMPORAL_SPLIT = False  # False = random patient split (often higher AUROC)
+ENABLE_WEIGHTED_BLEND = True  # optimize non-negative blend weights on val
+THRESHOLD_STRATEGY = "mcc"  # f1 | recall80 | j | mcc
+HPO_ALPHA_AUPRC = 0.35  # used only when OPTIMIZE_FOR_AUROC=False
+OPTIMIZE_FOR_AUROC = True
+BLEND_SEARCH_TRIALS = 500
+ENABLE_CT5_DIM_SELECTION = True
+CT5_KEEP_DIMS = 96  # keep top-variance ct5_k dimensions (numeric ct5_* only)
+USE_SELECTED_FEATURES_JSON = False  # ignore legacy selected_features.json by default
+ENABLE_AUTO_FEATURE_SUBSET = True
+FEATURE_SUBSET_CANDIDATES = [96, 128, 160, 220, 300]
 
 
 # ==============================================================================
@@ -156,7 +189,7 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     tab = pd.read_csv(path, low_memory=False).fillna(0)
 
     selected: Optional[List[str]] = None
-    if os.path.exists(SELECTED_FEATURES_JSON):
+    if USE_SELECTED_FEATURES_JSON and os.path.exists(SELECTED_FEATURES_JSON):
         with open(SELECTED_FEATURES_JSON) as f:
             selected = json.load(f)
         logger.info("Selected features: %d", len(selected))
@@ -176,12 +209,126 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     if selected:
         emb_cols = [c for c in df.columns if c.startswith("ct5_")]
         keep = [c for c in selected if c in df.columns] + emb_cols
-        X = df[keep].copy()
+        # Avoid eager block consolidation on very large frames (can OOM on Windows).
+        X = df.loc[:, keep]
     else:
-        X = df.drop(columns=list(id_cols & set(df.columns)), errors="ignore")
+        keep = [c for c in df.columns if c not in id_cols]
+        X = df.loc[:, keep]
+
+    # Optional dimensionality reduction by selecting the highest-variance numeric ct5_* dims.
+    if ENABLE_CT5_DIM_SELECTION:
+        ct5_vec_cols = [c for c in X.columns if c.startswith("ct5_") and c[4:].isdigit()]
+        if len(ct5_vec_cols) > CT5_KEEP_DIMS:
+            variances = X[ct5_vec_cols].var(axis=0, ddof=0)
+            keep_ct5 = variances.sort_values(ascending=False).head(CT5_KEEP_DIMS).index.tolist()
+            other_cols = [c for c in X.columns if c not in ct5_vec_cols]
+            X = X.loc[:, other_cols + keep_ct5]
+            logger.info(
+                "ct5 dimension selection: kept %d/%d numeric ct5 dims by variance.",
+                len(keep_ct5), len(ct5_vec_cols),
+            )
 
     logger.info("Feature matrix: %s | Positive rate: %.2f%%", X.shape, y.mean() * 100)
     return X, y, groups
+
+
+def auto_select_feature_subset(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: List[str],
+    pos_weight: float,
+) -> Tuple[np.ndarray, List[str], Dict[str, float]]:
+    """
+    Train-only feature reduction:
+      1) rank features by LightGBM gain on training split
+      2) evaluate candidate top-k subsets on validation AUROC
+      3) keep best k
+    """
+    n_features = X_tr.shape[1]
+    if n_features <= min(FEATURE_SUBSET_CANDIDATES):
+        return np.arange(n_features), list(feature_names), {
+            "enabled": False, "reason": "too_few_features", "selected_k": int(n_features)
+        }
+
+    logger.info("Auto feature subset search enabled (n_features=%d).", n_features)
+    ranker = lgb.LGBMClassifier(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        n_estimators=1200,
+        learning_rate=0.03,
+        num_leaves=127,
+        max_depth=10,
+        min_child_samples=40,
+        colsample_bytree=0.85,
+        subsample=0.85,
+        subsample_freq=1,
+        reg_alpha=0.2,
+        reg_lambda=1.5,
+        scale_pos_weight=pos_weight,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbosity=-1,
+    )
+    ranker.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+    )
+    gains = ranker.booster_.feature_importance(importance_type="gain")
+    order = np.argsort(-gains)
+    del ranker
+    gc.collect()
+
+    valid_candidates = sorted({k for k in FEATURE_SUBSET_CANDIDATES if k < n_features})
+    valid_candidates.append(n_features)
+    best_auc = -1.0
+    best_idx = np.arange(n_features)
+    diagnostics: Dict[str, float] = {"enabled": True, "n_features_full": int(n_features)}
+
+    for k in valid_candidates:
+        idx = order[:k]
+        probe = lgb.LGBMClassifier(
+            objective="binary",
+            metric="auc",
+            boosting_type="gbdt",
+            n_estimators=1600,
+            learning_rate=0.03,
+            num_leaves=127,
+            max_depth=10,
+            min_child_samples=30,
+            colsample_bytree=0.85,
+            subsample=0.85,
+            subsample_freq=1,
+            reg_alpha=0.2,
+            reg_lambda=1.5,
+            scale_pos_weight=pos_weight,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbosity=-1,
+        )
+        probe.fit(
+            X_tr[:, idx], y_tr,
+            eval_set=[(X_val[:, idx], y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+        )
+        val_probs = probe.predict_proba(X_val[:, idx])[:, 1]
+        auc = float(roc_auc_score(y_val, val_probs))
+        diagnostics[f"val_auroc_top_{k}"] = auc
+        logger.info("  Feature subset top-%d -> val AUROC: %.4f", k, auc)
+        if auc > best_auc:
+            best_auc = auc
+            best_idx = idx
+        del probe
+        gc.collect()
+
+    selected_names = [feature_names[i] for i in best_idx]
+    diagnostics["selected_k"] = int(len(best_idx))
+    diagnostics["selected_val_auroc"] = float(best_auc)
+    logger.info("Auto feature subset selected: top-%d (val AUROC %.4f).", len(best_idx), best_auc)
+    return np.array(best_idx, dtype=int), selected_names, diagnostics
 
 
 # ==============================================================================
@@ -258,8 +405,8 @@ def optimize_lgbm(
     logger.info("Optuna HPO: %d trials ...", n_trials)
 
     def objective(trial: optuna.Trial) -> float:
-        # gbdt/goss appear twice to reduce costly dart sampling frequency
-        boosting  = trial.suggest_categorical("boosting_type", ["gbdt", "gbdt", "dart", "goss", "goss"])
+        # AUROC-focused: bias search toward gbdt/goss, avoid expensive/unstable dart.
+        boosting  = trial.suggest_categorical("boosting_type", ["gbdt", "gbdt", "gbdt", "goss"])
         imbalance = trial.suggest_categorical(
             "imbalance_strategy", ["scale_pos_weight", "is_unbalance"]
         )
@@ -269,22 +416,23 @@ def optimize_lgbm(
             "metric":            "auc",
             "verbosity":         -1,
             "boosting_type":     boosting,
-            "num_leaves":        trial.suggest_int("num_leaves", 63, 300),
-            "max_depth":         trial.suggest_int("max_depth", 6, 16),
-            "learning_rate":     trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
+            "num_leaves":        trial.suggest_int("num_leaves", 63, 255),
+            "max_depth":         trial.suggest_int("max_depth", 5, 13),
+            "learning_rate":     trial.suggest_float("learning_rate", 0.003, 0.05, log=True),
             # DART has no early stopping so cap trees to avoid 20-min trials
             "n_estimators": (
                 trial.suggest_int("n_estimators", 500, DART_MAX_TREES)
                 if boosting == "dart"
-                else trial.suggest_int("n_estimators", 500, 3000)
+                else trial.suggest_int("n_estimators", 800, 4500)
             ),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
-            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.4, 1.0),
-            "colsample_bynode":  trial.suggest_float("colsample_bynode", 0.4, 1.0),
-            "reg_alpha":         trial.suggest_float("reg_alpha", 0.0, 2.0),
-            "reg_lambda":        trial.suggest_float("reg_lambda", 0.0, 2.0),
-            "min_split_gain":    trial.suggest_float("min_split_gain", 0.0, 1.0),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
+            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.55, 1.0),
+            "colsample_bynode":  trial.suggest_float("colsample_bynode", 0.55, 1.0),
+            "reg_alpha":         trial.suggest_float("reg_alpha", 0.0, 4.0),
+            "reg_lambda":        trial.suggest_float("reg_lambda", 0.1, 6.0),
+            "min_split_gain":    trial.suggest_float("min_split_gain", 0.0, 0.5),
             "path_smooth":       trial.suggest_float("path_smooth", 0.0, 1.0),
+            "max_bin":           trial.suggest_int("max_bin", 127, 511),
             "random_state":      RANDOM_STATE,
             "n_jobs":            -1,
         }
@@ -312,9 +460,16 @@ def optimize_lgbm(
             callbacks=[lgb.early_stopping(50, verbose=False),
                        lgb.log_evaluation(-1)],
         )
-        return roc_auc_score(y_val, m.predict_proba(X_val)[:, 1])
+        val_probs = m.predict_proba(X_val)[:, 1]
+        auroc = roc_auc_score(y_val, val_probs)
+        auprc = average_precision_score(y_val, val_probs)
+        trial.set_user_attr("val_auroc", float(auroc))
+        trial.set_user_attr("val_auprc", float(auprc))
+        if OPTIMIZE_FOR_AUROC:
+            return float(auroc)
+        return composite_rank_score(y_val, val_probs)
 
-    sampler = optuna.samplers.TPESampler(multivariate=True, seed=RANDOM_STATE)
+    sampler = optuna.samplers.TPESampler(multivariate=False, seed=RANDOM_STATE)
     # MedianPruner is safe and reliable; HyperbandPruner can terminate early unexpectedly
     pruner  = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
     study   = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
@@ -341,7 +496,11 @@ def optimize_lgbm(
         "objective": "binary", "metric": "auc",
         "verbosity": -1, "n_jobs": -1, "random_state": RANDOM_STATE,
     })
-    logger.info("Best HPO AUROC: %.4f", study.best_value)
+    logger.info(
+        "Best HPO score (metric=%s): %.4f",
+        "AUROC" if OPTIMIZE_FOR_AUROC else "composite",
+        study.best_value,
+    )
     logger.info("Best params: %s", best)
     return best
 
@@ -356,15 +515,23 @@ def patient_level_cv(
     n_folds: int = N_FOLDS,
 ) -> Tuple[float, float, List[float]]:
     """
-    GroupKFold CV grouped by subject_id.
+    StratifiedGroupKFold CV (fallback: GroupKFold) grouped by subject_id.
     Guarantees no patient's records appear in both train and validation folds.
     Returns (mean_auroc, std_auroc, per_fold_aurocs).
     """
-    logger.info("Patient-level GroupKFold CV (%d folds) ...", n_folds)
-    gkf    = GroupKFold(n_splits=n_folds)
+    logger.info("Patient-level grouped CV (%d folds) ...", n_folds)
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+        splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+        split_iter = splitter.split(X, y, groups)
+        logger.info("Using StratifiedGroupKFold.")
+    except Exception:
+        gkf = GroupKFold(n_splits=n_folds)
+        split_iter = gkf.split(X, y, groups)
+        logger.info("StratifiedGroupKFold unavailable; using GroupKFold.")
     scores = []
 
-    for fold, (tr_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+    for fold, (tr_idx, val_idx) in enumerate(split_iter):
         X_tr_cv  = X.iloc[tr_idx].values.astype(np.float32)
         y_tr_cv  = y.iloc[tr_idx].values
         X_val_cv = X.iloc[val_idx].values.astype(np.float32)
@@ -470,6 +637,29 @@ def build_ensemble(
         except Exception as e:
             logger.warning("XGBoost failed (%s) — LightGBM only.", e)
 
+        try:
+            from catboost import CatBoostClassifier
+            logger.info("Training CatBoost ...")
+            cb_model = CatBoostClassifier(
+                iterations=1200,
+                learning_rate=float(params.get("learning_rate", 0.03)),
+                depth=min(int(params.get("max_depth", 8)), 10),
+                l2_leaf_reg=max(float(params.get("reg_lambda", 1.0)), 1e-6),
+                eval_metric="AUC",
+                loss_function="Logloss",
+                random_seed=RANDOM_STATE,
+                verbose=False,
+                auto_class_weights="Balanced",
+            )
+            cb_model.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True)
+            auc_cb = roc_auc_score(y_val, cb_model.predict_proba(X_val)[:, 1])
+            logger.info("CatBoost val AUROC: %.4f", auc_cb)
+            models.append(("catboost", cb_model))
+        except ImportError:
+            logger.warning("catboost not installed - skipping. pip install catboost")
+        except Exception as e:
+            logger.warning("CatBoost failed (%s) - continuing.", e)
+
     return models
 
 
@@ -482,45 +672,158 @@ def ensemble_predict(models: List[Tuple[str, object]], X: np.ndarray) -> np.ndar
 # 6. META-LEARNER STACKING
 # ==============================================================================
 
+def _optimize_blend_weights(
+    val_stack: np.ndarray,
+    y_val: np.ndarray,
+    trials: int = BLEND_SEARCH_TRIALS,
+) -> np.ndarray:
+    """Random-search non-negative weights (sum to 1) for ensemble blending."""
+    rng = np.random.RandomState(RANDOM_STATE)
+    n_models = val_stack.shape[1]
+    best_w = np.ones(n_models, dtype=np.float64) / max(n_models, 1)
+    best_score = composite_rank_score(y_val, val_stack @ best_w)
+    for _ in range(trials):
+        w = rng.dirichlet(np.ones(n_models))
+        score = composite_rank_score(y_val, val_stack @ w)
+        if score > best_score:
+            best_score = score
+            best_w = w
+    return best_w
+
+
 def fit_meta_learner(
     models: List[Tuple[str, object]],
     X_val: np.ndarray, y_val: np.ndarray,
     X_te: np.ndarray,
-) -> Tuple[Optional[LogisticRegression], np.ndarray]:
+) -> Tuple[Optional[LogisticRegression], np.ndarray, np.ndarray, Dict[str, object]]:
     """
-    Trains Logistic Regression on val-set OOF predictions from each base model.
-    Test probabilities come from the stacked meta prediction.
+    Selects the best stacker on validation data among:
+      1) simple mean
+      2) optimized weighted blend
+      3) logistic meta-learner
+    Returns meta model (if selected), val probs, test probs, and diagnostics.
     """
-    if len(models) < 2:
-        return None, ensemble_predict(models, X_te)
-
-    logger.info("Fitting meta-learner ...")
     val_stack = np.column_stack([m.predict_proba(X_val)[:, 1] for _, m in models])
-    te_stack  = np.column_stack([m.predict_proba(X_te)[:, 1]  for _, m in models])
+    te_stack = np.column_stack([m.predict_proba(X_te)[:, 1] for _, m in models])
 
-    meta = LogisticRegression(C=1.0, max_iter=1000, random_state=RANDOM_STATE)
-    meta.fit(val_stack, y_val)
+    if len(models) < 2:
+        p_val = val_stack[:, 0]
+        p_te = te_stack[:, 0]
+        return None, p_val, p_te, {"selected_stacker": "single_model"}
 
-    auc_meta = roc_auc_score(y_val, meta.predict_proba(val_stack)[:, 1])
-    logger.info("Meta-learner val AUROC: %.4f", auc_meta)
-    return meta, meta.predict_proba(te_stack)[:, 1]
+    candidates: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[LogisticRegression]]] = {}
+
+    # Candidate 1: simple mean
+    candidates["mean"] = (
+        val_stack.mean(axis=1),
+        te_stack.mean(axis=1),
+        None,
+    )
+
+    # Candidate 2: weighted blend
+    if ENABLE_WEIGHTED_BLEND:
+        w = _optimize_blend_weights(val_stack, y_val)
+        candidates["weighted_blend"] = (
+            val_stack @ w,
+            te_stack @ w,
+            None,
+        )
+
+    # Candidate 3: logistic meta-learner with light C search
+    best_meta = None
+    best_meta_score = -np.inf
+    best_meta_val = None
+    best_meta_te = None
+    for c in [0.3, 1.0, 3.0, 10.0]:
+        meta = LogisticRegression(C=c, max_iter=2000, random_state=RANDOM_STATE)
+        meta.fit(val_stack, y_val)
+        p_val = meta.predict_proba(val_stack)[:, 1]
+        p_te = meta.predict_proba(te_stack)[:, 1]
+        sc = composite_rank_score(y_val, p_val)
+        if sc > best_meta_score:
+            best_meta_score = sc
+            best_meta = meta
+            best_meta_val = p_val
+            best_meta_te = p_te
+    candidates["meta_lr"] = (best_meta_val, best_meta_te, best_meta)
+
+    # Select highest composite score on validation
+    best_name = None
+    best_score = -np.inf
+    best_val = None
+    best_te = None
+    best_model = None
+    for name, (p_val, p_te, m) in candidates.items():
+        sc = composite_rank_score(y_val, p_val)
+        auc = roc_auc_score(y_val, p_val)
+        ap = average_precision_score(y_val, p_val)
+        logger.info("Stacker %-15s | score: %.4f | AUROC: %.4f | AUPRC: %.4f", name, sc, auc, ap)
+        if sc > best_score:
+            best_name, best_score, best_val, best_te, best_model = name, sc, p_val, p_te, m
+
+    return best_model, best_val, best_te, {
+        "selected_stacker": best_name,
+        "val_composite_score": float(best_score),
+    }
 
 
 # ==============================================================================
 # 7. CALIBRATION
 # ==============================================================================
 
+class PlattCalibrator:
+    """Pickle-safe wrapper to provide .predict() interface like IsotonicRegression."""
+
+    def __init__(self, lr: LogisticRegression):
+        self.lr = lr
+
+    def predict(self, probs_1d: np.ndarray) -> np.ndarray:
+        arr = np.asarray(probs_1d).reshape(-1, 1)
+        return self.lr.predict_proba(arr)[:, 1]
+
+
 def calibrate(
     val_probs: np.ndarray, y_val: np.ndarray,
     test_probs: np.ndarray,
-) -> Tuple[IsotonicRegression, np.ndarray]:
-    """Isotonic regression calibration. Fitted on val, applied to test."""
-    cal = IsotonicRegression(out_of_bounds="clip")
-    cal.fit(val_probs, y_val)
+) -> Tuple[object, np.ndarray, str]:
+    """
+    Fit both Isotonic and Platt (logistic) calibration on validation probs.
+    Select method with lower validation Brier score (tie-break: lower log loss).
+    """
     ece_before = _ece(val_probs, y_val)
-    ece_after  = _ece(cal.predict(val_probs), y_val)
+
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(val_probs, y_val)
+    val_iso = iso.predict(val_probs)
+    test_iso = iso.predict(test_probs).astype(np.float32)
+    brier_iso = brier_score_loss(y_val, val_iso)
+    ll_iso = log_loss(y_val, np.clip(val_iso, 1e-6, 1 - 1e-6))
+
+    platt = LogisticRegression(C=1.0, max_iter=1000, random_state=RANDOM_STATE)
+    platt.fit(val_probs.reshape(-1, 1), y_val)
+    val_platt = platt.predict_proba(val_probs.reshape(-1, 1))[:, 1]
+    test_platt = platt.predict_proba(test_probs.reshape(-1, 1))[:, 1].astype(np.float32)
+    brier_platt = brier_score_loss(y_val, val_platt)
+    ll_platt = log_loss(y_val, np.clip(val_platt, 1e-6, 1 - 1e-6))
+
+    use_iso = (brier_iso < brier_platt) or (abs(brier_iso - brier_platt) < 1e-6 and ll_iso <= ll_platt)
+    if use_iso:
+        chosen = "isotonic"
+        cal = iso
+        test_cal = test_iso
+        ece_after = _ece(val_iso, y_val)
+    else:
+        chosen = "platt"
+        cal = PlattCalibrator(platt)
+        test_cal = test_platt
+        ece_after = _ece(val_platt, y_val)
+
+    logger.info(
+        "Calibration selected: %s | Brier iso=%.4f platt=%.4f | LogLoss iso=%.4f platt=%.4f",
+        chosen, brier_iso, brier_platt, ll_iso, ll_platt,
+    )
     logger.info("ECE before calibration: %.4f -> after: %.4f", ece_before, ece_after)
-    return cal, cal.predict(test_probs).astype(np.float32)
+    return cal, test_cal, chosen
 
 
 def _ece(probs: np.ndarray, y: np.ndarray, n_bins: int = 10) -> float:
@@ -541,41 +844,74 @@ def find_best_threshold(
     val_probs: np.ndarray, y_val: np.ndarray,
     strategy: str = "f1",
 ) -> float:
-    """
-    Finds the optimal decision threshold on the VALIDATION SET only.
-    Never uses test data — avoids look-ahead bias.
-
-    strategy options
-    ----------------
-    "f1"       : maximise F1 on readmit=1 class (recommended default)
-    "recall80" : highest precision while keeping recall ≥ 0.80
-                 (clinical: catch at least 80% of readmissions)
-    "j"        : Youden's J = sensitivity + specificity − 1
-    """
-    thresholds = np.arange(0.05, 0.70, 0.005)
+    """Finds the best decision threshold using validation data only."""
+    thresholds = np.arange(0.01, 0.99, 0.005)
 
     if strategy == "f1":
         scores = [f1_score(y_val, val_probs >= t, zero_division=0) for t in thresholds]
-        best   = float(thresholds[np.argmax(scores)])
-
+        best = float(thresholds[np.argmax(scores)])
     elif strategy == "recall80":
         best = 0.50
         for t in sorted(thresholds, reverse=True):
             preds = (val_probs >= t).astype(int)
-            rec   = preds[y_val == 1].mean() if (y_val == 1).sum() > 0 else 0.0
+            rec = preds[y_val == 1].mean() if (y_val == 1).sum() > 0 else 0.0
             if rec >= 0.80:
                 best = float(t)
                 break
-
     elif strategy == "j":
         fpr, tpr, thresh = roc_curve(y_val, val_probs)
         best = float(thresh[np.argmax(tpr - fpr)])
-
+    elif strategy == "mcc":
+        scores = [matthews_corrcoef(y_val, (val_probs >= t).astype(int)) for t in thresholds]
+        best = float(thresholds[np.argmax(scores)])
     else:
         best = 0.50
 
     logger.info("Threshold strategy='%s' -> best threshold=%.3f", strategy, best)
     return best
+
+
+def _binary_metrics(y_true: np.ndarray, probs: np.ndarray, threshold: float) -> Dict[str, float]:
+    preds = (probs >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_true == 1)).sum())
+    tn = int(((preds == 0) & (y_true == 0)).sum())
+    fp = int(((preds == 1) & (y_true == 0)).sum())
+    fn = int(((preds == 0) & (y_true == 1)).sum())
+    recall = tp / max(tp + fn, 1)
+    precision = tp / max(tp + fp, 1)
+    specificity = tn / max(tn + fp, 1)
+    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
+    f1 = f1_score(y_true, preds, zero_division=0)
+    mcc = matthews_corrcoef(y_true, preds)
+    return {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy),
+        "recall": float(recall),
+        "precision": float(precision),
+        "specificity": float(specificity),
+        "f1": float(f1),
+        "mcc": float(mcc),
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def summarize_operating_points(
+    y_val: np.ndarray,
+    val_probs_cal: np.ndarray,
+    y_te: np.ndarray,
+    test_probs_cal: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """Threshold profiles selected on validation, measured on test."""
+    thresholds = {
+        "mcc": find_best_threshold(val_probs_cal, y_val, "mcc"),
+        "f1": find_best_threshold(val_probs_cal, y_val, "f1"),
+        "recall80": find_best_threshold(val_probs_cal, y_val, "recall80"),
+        "j": find_best_threshold(val_probs_cal, y_val, "j"),
+    }
+    return {k: _binary_metrics(y_te, test_probs_cal, t) for k, t in thresholds.items()}
 
 
 # ==============================================================================
@@ -609,9 +945,7 @@ def save_plots(
     axes[1].set(xlabel="Recall", ylabel="Precision", title="Precision-Recall Curve")
     axes[1].legend(loc="upper right")
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "roc_pr_curve.png"), dpi=150)
-    plt.close()
+    save_publication_figure(fig, os.path.join(FIGURES_DIR, "roc_pr_curve.png"))
 
     # -- Calibration curve -----------------------------------------------------
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -622,9 +956,7 @@ def save_plots(
     ax.set(xlabel="Mean Predicted Probability", ylabel="Fraction Positives",
            title="Calibration (Reliability Diagram)")
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "calibration_curve.png"), dpi=150)
-    plt.close()
+    save_publication_figure(fig, os.path.join(FIGURES_DIR, "calibration_curve.png"))
 
     # -- Threshold analysis -----------------------------------------------------
     thresholds = np.arange(0.05, 0.70, 0.01)
@@ -647,9 +979,7 @@ def save_plots(
     ax.set(xlabel="Decision Threshold", ylabel="Score",
            title="Threshold Analysis — Readmit=1 Class", ylim=[0, 1])
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURES_DIR, "threshold_analysis.png"), dpi=150)
-    plt.close()
+    save_publication_figure(fig, os.path.join(FIGURES_DIR, "threshold_analysis.png"))
 
     logger.info("Plots saved -> %s", FIGURES_DIR)
 
@@ -679,10 +1009,7 @@ def compute_shap(model, X_sample: pd.DataFrame) -> None:
             sv = sv[1]
         plt.figure(figsize=(10, 8))
         shap.summary_plot(sv, X_sample, max_display=30, show=False)
-        plt.tight_layout()
-        plt.savefig(os.path.join(FIGURES_DIR, "shap_summary.png"), dpi=150,
-                    bbox_inches="tight")
-        plt.close()
+        save_publication_figure(plt.gcf(), os.path.join(FIGURES_DIR, "shap_summary.png"))
         logger.info("SHAP plot saved.")
     except Exception as e:
         logger.warning("SHAP failed: %s", e)
@@ -746,11 +1073,31 @@ class TRANCETrainer:
         # -- 1. Load -------------------------------------------------------
         X, y, groups = load_data()
         self.features = list(X.columns)
+        feature_subset_info: Dict[str, object] = {"enabled": False}
 
-        # -- 2. Temporal patient-level split -------------------------------
-        # Sort patients by index of their first record -> approximate temporal order
-        pat_first   = groups.reset_index(drop=True).groupby(groups.values).first()
-        sorted_pats = pat_first.sort_values().index.tolist()
+        # -- 2. Patient-level split ----------------------------------------
+        if USE_TEMPORAL_SPLIT:
+            # Prefer pseudo-time from anchor_year_group + admission_month if present.
+            # Fallback to row index order when temporal columns are missing.
+            X_reset = X.reset_index(drop=True)
+            if {"anchor_year_group", "admission_month"}.issubset(set(X_reset.columns)):
+                time_key = (
+                    pd.to_numeric(X_reset["anchor_year_group"], errors="coerce").fillna(0).astype(float) * 12.0
+                    + pd.to_numeric(X_reset["admission_month"], errors="coerce").fillna(0).astype(float)
+                )
+                logger.info("Temporal split using anchor_year_group + admission_month.")
+            else:
+                time_key = pd.Series(np.arange(len(X_reset)), index=X_reset.index, dtype="float64")
+                logger.info("Temporal columns missing; split fallback uses row order.")
+
+            pat_first = pd.DataFrame({"subject_id": groups.values, "time_key": time_key.values}) \
+                .groupby("subject_id", as_index=False)["time_key"].min()
+            sorted_pats = pat_first.sort_values(["time_key", "subject_id"])["subject_id"].tolist()
+        else:
+            rng = np.random.RandomState(RANDOM_STATE)
+            sorted_pats = list(groups.drop_duplicates().values)
+            rng.shuffle(sorted_pats)
+            logger.info("Patient-level random split enabled (USE_TEMPORAL_SPLIT=False).")
 
         n_test  = int(len(sorted_pats) * TEST_FRAC)
         n_val   = int(len(sorted_pats) * VAL_FRAC)
@@ -777,6 +1124,18 @@ class TRANCETrainer:
         pos_weight = float((y_tr == 0).sum() / max((y_tr == 1).sum(), 1))
         logger.info("Class imbalance (pos_weight): %.2f", pos_weight)
 
+        # -- 3.5 Train-only feature subset search --------------------------
+        if ENABLE_AUTO_FEATURE_SUBSET:
+            feat_idx, feat_names, feature_subset_info = auto_select_feature_subset(
+                X_tr, y_tr, X_val, y_val, self.features, pos_weight
+            )
+            X_tr = X_tr[:, feat_idx]
+            X_val = X_val[:, feat_idx]
+            X_te = X_te[:, feat_idx]
+            X = X.loc[:, feat_names]
+            self.features = feat_names
+            logger.info("Using feature subset: %d features.", len(self.features))
+
         # -- 3. SMOTE on training fold -------------------------------------
         if ENABLE_SMOTE:
             X_tr, y_tr = apply_smote(X_tr, y_tr)
@@ -802,25 +1161,25 @@ class TRANCETrainer:
 
         # -- 7. Meta-learner stacking --------------------------------------
         if ENABLE_STACK and len(self.models) > 1:
-            self.meta, test_probs_raw = fit_meta_learner(
+            self.meta, val_probs_for_cal, test_probs_raw, stack_info = fit_meta_learner(
                 self.models, X_val, y_val, X_te
             )
-            val_probs_for_cal = self.meta.predict_proba(
-                np.column_stack([m.predict_proba(X_val)[:, 1] for _, m in self.models])
-            )[:, 1]
+            logger.info("Selected stacker: %s", stack_info.get("selected_stacker"))
         else:
             self.meta = None
+            stack_info = {"selected_stacker": "mean"}
             test_probs_raw    = ensemble_predict(self.models, X_te)
             val_probs_for_cal = ensemble_predict(self.models, X_val)
 
         # -- 8. Isotonic calibration ---------------------------------------
-        self.calibrator, test_probs_cal = calibrate(
+        self.calibrator, test_probs_cal, calibration_method = calibrate(
             val_probs_for_cal, y_val, test_probs_raw
         )
+        val_probs_cal = self.calibrator.predict(val_probs_for_cal).astype(np.float32)
 
         # -- 9. Threshold optimisation (val set only) ----------------------
         self.best_threshold = find_best_threshold(
-            val_probs_for_cal, y_val, strategy="recall80"
+            val_probs_cal, y_val, strategy=THRESHOLD_STRATEGY
         )
 
         # -- 10. Metrics ---------------------------------------------------
@@ -830,12 +1189,14 @@ class TRANCETrainer:
         brier    = brier_score_loss(y_te, test_probs_cal)
         ll       = log_loss(y_te, test_probs_cal)
 
-        test_preds = (test_probs_raw >= self.best_threshold).astype(int)
+        test_preds = (test_probs_cal >= self.best_threshold).astype(int)
         report     = classification_report(y_te, test_preds, output_dict=True,
                                            zero_division=0)
         recall_pos = report.get("1", {}).get("recall",    0.0)
         prec_pos   = report.get("1", {}).get("precision", 0.0)
         f1_pos     = report.get("1", {}).get("f1-score",  0.0)
+        mcc_pos    = matthews_corrcoef(y_te, test_preds)
+        op_points  = summarize_operating_points(y_val, val_probs_cal, y_te, test_probs_cal)
 
         logger.info("=" * 60)
         logger.info("FINAL TEST RESULTS")
@@ -845,11 +1206,12 @@ class TRANCETrainer:
         logger.info("  Brier Score:               %.4f", brier)
         logger.info("  Log Loss:                  %.4f", ll)
         logger.info("  CV AUROC:                  %.4f ± %.4f", cv_mean, cv_std)
-        logger.info("  Best threshold (val F1):   %.3f", self.best_threshold)
+        logger.info("  Best threshold (val %s):   %.3f", THRESHOLD_STRATEGY, self.best_threshold)
         logger.info("  -- Readmit=1 @ threshold %.3f --", self.best_threshold)
         logger.info("  Recall    (sensitivity):   %.4f", recall_pos)
         logger.info("  Precision (PPV):           %.4f", prec_pos)
         logger.info("  F1 score:                  %.4f", f1_pos)
+        logger.info("  MCC:                       %.4f", mcc_pos)
         logger.info("=" * 60)
 
         # -- 11. Ablation --------------------------------------------------
@@ -894,9 +1256,16 @@ class TRANCETrainer:
             "cv_auroc_mean":      round(cv_mean,    4),
             "cv_auroc_std":       round(cv_std,     4),
             "best_threshold":     round(self.best_threshold, 3),
+            "threshold_strategy": THRESHOLD_STRATEGY,
+            "calibration_method": calibration_method,
+            "smote_enabled": ENABLE_SMOTE,
+            "feature_subset": feature_subset_info,
             "recall_readmit1":    round(recall_pos, 4),
             "precision_readmit1": round(prec_pos,   4),
             "f1_readmit1":        round(f1_pos,     4),
+            "mcc_readmit1":       round(mcc_pos,    4),
+            "operating_points":   op_points,
+            "stacking":           stack_info,
             "ablation":           ablation,
             "n_models":           len(self.models),
             "n_features":         len(self.features),
@@ -909,11 +1278,26 @@ class TRANCETrainer:
             },
             "timestamp": datetime.now().isoformat(),
         }
+        # Compute and store per-feature training means for use in 08_predict.py
+        # This lets the CLI use realistic population-level defaults for EHR features
+        # (lab values, vital signs, ICD pivots) that can't be entered manually.
+        try:
+            X_all_np = np.vstack([X_tr, X_val])
+            self._X_train_means = {
+                feat: float(np.nanmean(X_all_np[:, i]))
+                for i, feat in enumerate(self.features)
+            }
+            logger.info("Feature means computed for %d features.", len(self._X_train_means))
+        except Exception as e:
+            logger.warning("Could not compute feature means: %s", e)
+            self._X_train_means = {}
+
         self._save(results)
         return results
 
     def _save(self, results: Dict) -> None:
         os.makedirs(MODELS_DIR, exist_ok=True)
+        feature_means = getattr(self, "_X_train_means", {})
         joblib.dump(
             {
                 "models":         self.models,
@@ -922,6 +1306,7 @@ class TRANCETrainer:
                 "features":       self.features,
                 "best_params":    self.best_params,
                 "best_threshold": self.best_threshold,
+                "feature_means":  feature_means,
                 "timestamp":      datetime.now().isoformat(),
             },
             MAIN_MODEL_PKL,

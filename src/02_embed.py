@@ -46,12 +46,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-EMBEDDING_DIM   = 128          # final PCA dimension
+EMBEDDING_DIM   = 256          # final PCA dimension (higher text capacity)
 MAX_SEQ_LEN     = 512
 GPU_BATCH       = 4            # safe for 3050 8GB
 CPU_BATCH       = 8
 MIN_TEXT_LEN    = 50
-MAX_TEXT_CHARS  = 3000         # chars per admission
+MAX_TEXT_CHARS  = 5000         # chars per admission
+CHUNK_WORDS     = 220
+CHUNK_OVERLAP   = 40
+MAX_CHUNKS_PER_NOTE = 6
 
 # Model priority order — first one that loads wins
 MODEL_CANDIDATES = [
@@ -77,22 +80,27 @@ def preprocess_note(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
         return ""
     # Remove MIMIC de-id placeholders
     text = re.sub(r"\[\*\*.*?\*\*\]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("\r", "\n")
 
     # Try extracting high-value sections
     extracted = []
-    text_lower = text.lower()
+    text_lower = text.lower()  # same length as text; safe for span mapping
     for sec in HIGH_VALUE_SECTIONS:
         pat = re.compile(
-            rf"(?:^|\n|\r){re.escape(sec)}\s*[:\-]?\s*(.*?)(?=\n[A-Z][A-Z /]+[:\-]|\Z)",
-            re.IGNORECASE | re.DOTALL
+            rf"{re.escape(sec)}\s*[:\-]?\s*(.*?)(?=\n[A-Z][A-Z /]{2,40}\s*[:\-]|\Z)",
+            re.IGNORECASE | re.DOTALL,
         )
         m = pat.search(text_lower)
         if m:
             s, e = m.span(1)
-            extracted.append(text[s:e].strip()[:1000])
+            block = re.sub(r"\s+", " ", text[s:e]).strip()
+            if block:
+                extracted.append(block[:1200])
 
-    result = " [SEP] ".join(extracted) if extracted else text
+    if extracted:
+        result = " [SEP] ".join(extracted)
+    else:
+        result = re.sub(r"\s+", " ", text).strip()
     return result[:max_chars]
 
 
@@ -217,29 +225,66 @@ def encode_batch(model, tokenizer, texts: List[str], device: torch.device,
     return result
 
 
+def _note_chunks(text: str) -> List[str]:
+    if not text or len(text.strip()) == 0:
+        return []
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    step = max(CHUNK_WORDS - CHUNK_OVERLAP, 1)
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + CHUNK_WORDS]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if len(chunks) >= MAX_CHUNKS_PER_NOTE:
+            break
+    return chunks
+
+
 def encode_all(model, tokenizer, texts: List[str], device: torch.device,
                mtype: str, batch_size: int) -> np.ndarray:
+    """
+    Encode each admission note using chunked pooling:
+      - split long note into chunks
+      - encode chunks
+      - average chunk embeddings
+    Missing notes get a dedicated token string to preserve a learnable signature.
+    """
     all_emb = []
     n = len(texts)
-    for i in range(0, n, batch_size):
-        batch = [t if t and len(t.strip()) > 0 else "patient admission" for t in texts[i:i+batch_size]]
+
+    for i, text in enumerate(texts):
+        chunks = _note_chunks(text)
+        if not chunks:
+            chunks = ["[NO_NOTE]"]
+
         try:
-            emb = encode_batch(model, tokenizer, batch, device, mtype)
+            emb_parts = []
+            for j in range(0, len(chunks), batch_size):
+                part = chunks[j:j + batch_size]
+                emb_parts.append(encode_batch(model, tokenizer, part, device, mtype))
+            emb_note = np.vstack(emb_parts).mean(axis=0, keepdims=True)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.warning("OOM at batch %d; trying batch_size=1", i)
+                logger.warning("OOM at note %d; trying chunk-by-chunk", i)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
-                emb = np.vstack([encode_batch(model, tokenizer, [t], device, mtype) for t in batch])
+                emb_note = np.vstack(
+                    [encode_batch(model, tokenizer, [c], device, mtype) for c in chunks]
+                ).mean(axis=0, keepdims=True)
             else:
                 raise
-        all_emb.append(emb)
-        if device.type == "cuda":
+
+        all_emb.append(emb_note.astype(np.float32))
+
+        if device.type == "cuda" and i % 100 == 0:
             torch.cuda.empty_cache()
-        gc.collect()
-        if (i // batch_size) % 50 == 0:
-            logger.info("  Encoded %d/%d (%.1f%%)", min(i+batch_size, n), n, min(i+batch_size, n)/n*100)
+        if i % 500 == 0:
+            gc.collect()
+            logger.info("  Encoded %d/%d (%.1f%%)", i + 1, n, (i + 1) / n * 100)
+
     return np.vstack(all_emb).astype(np.float32)
 
 
@@ -261,9 +306,12 @@ class EmbeddingPipeline:
 
         notes        = load_notes(cohort_hadm, self.file_index)
         hadm_to_text = dict(zip(notes["hadm_id"], notes["text"]))
-        texts        = [hadm_to_text.get(h, "patient hospitalization") for h in feat_hadm]
+        texts        = [hadm_to_text.get(h, "") for h in feat_hadm]
         n_matched    = sum(h in hadm_to_text for h in feat_hadm)
         logger.info("Notes matched: %d/%d (%.1f%%)", n_matched, len(feat_hadm), n_matched/len(feat_hadm)*100)
+        has_note = np.array([1.0 if t and len(t.strip()) >= MIN_TEXT_LEN else 0.0 for t in texts], dtype=np.float32)
+        note_len_chars = np.array([len(t) for t in texts], dtype=np.float32)
+        note_len_tokens = np.array([len(t.split()) if isinstance(t, str) else 0 for t in texts], dtype=np.float32)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Device: %s", device)
@@ -333,6 +381,10 @@ class EmbeddingPipeline:
         # ── Save ──────────────────────────────────────────────────────────
         n_dims = embeddings.shape[1]
         emb_df = pd.DataFrame(embeddings, columns=[f"ct5_{i}" for i in range(n_dims)])
+        # Explicit text-quality signals improve fusion robustness.
+        emb_df["ct5_has_note"] = has_note
+        emb_df["ct5_note_len_chars"] = np.log1p(note_len_chars).astype(np.float32)
+        emb_df["ct5_note_len_tokens"] = np.log1p(note_len_tokens).astype(np.float32)
         emb_df["hadm_id"] = feat_hadm
         emb_df.to_csv(EMBEDDINGS_CSV, index=False)
         joblib.dump(model_info, EMBEDDING_INFO_PKL)

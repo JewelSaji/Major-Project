@@ -41,7 +41,16 @@ def run_diagnostics():
         return
 
     emb_df  = pd.read_csv(EMBEDDINGS_CSV)
-    feat_df = pd.read_csv(FEATURES_CSV, low_memory=False)
+    # Full CSV is ~400MB and causes C parser OOM even with usecols.
+    # Solution: chunked read with python engine which streams line-by-line.
+    chunks = []
+    for chunk in pd.read_csv(
+        FEATURES_CSV, chunksize=20_000,
+        usecols=lambda c: c in ("hadm_id", "readmit_30"),
+        engine="python", on_bad_lines="skip",
+    ):
+        chunks.append(chunk[["hadm_id", "readmit_30"]])
+    feat_df = pd.concat(chunks, ignore_index=True)
 
     # ── 2. Align on hadm_id ───────────────────────────────────────────────────
     merged = feat_df[["hadm_id", "readmit_30"]].merge(emb_df, on="hadm_id", how="inner")
