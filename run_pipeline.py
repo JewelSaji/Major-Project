@@ -47,13 +47,19 @@ def main():
     steps = [
         ("Feature Extraction", "01_extract.py"),
         ("Feature Selection (SHAP)", "01b_select_features.py"),
+    ]
+
+    if os.environ.get("RUN_CT5_FINETUNE", "0") == "1":
+        steps.append(("Clinical T5 LoRA Fine-tuning", "02a_finetune_clinical_t5.py"))
+
+    steps.extend([
         ("Clinical T5 Embedding", "02_embed.py"),
         ("Model Training & Calibration", "03_train.py"),
         ("Embedding Diagnostics", "04_diagnose.py"),
         ("SHAP Interpretability", "05_analyze.py"),
         ("Journal Visualizations", "06_visualize.py"),
         ("Cross-Paper Model Comparison", "09_compare_models.py"),
-    ]
+    ])
     
     total_start = time.time()
     success_count = 0

@@ -45,6 +45,13 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+FINETUNED_ENCODER_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models",
+    "clinical_t5_finetuned",
+    "encoder",
+)
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 EMBEDDING_DIM   = 256          # final PCA dimension (higher text capacity)
 MAX_SEQ_LEN     = 512
@@ -56,13 +63,18 @@ CHUNK_WORDS     = 220
 CHUNK_OVERLAP   = 40
 MAX_CHUNKS_PER_NOTE = 6
 
-# Model priority order — first one that loads wins
-MODEL_CANDIDATES = [
-    ("luqh/ClinicalT5-base",              "t5",    True),    # T5 encoder, Flax
-    ("emilyalsentzer/Bio_ClinicalBERT",   "bert",  False),   # BERT, PyTorch ✓
-    ("allenai/biomed_roberta_base",       "bert",  False),   # BioMed RoBERTa
-    ("sentence-transformers/all-mpnet-base-v2", "bert", False),  # general fallback
-]
+def _model_candidates() -> List[tuple]:
+    # Prioritize local fine-tuned encoder if available.
+    cand: List[tuple] = []
+    if os.path.exists(os.path.join(FINETUNED_ENCODER_DIR, "config.json")):
+        cand.append((FINETUNED_ENCODER_DIR, "t5", False))
+    cand.extend([
+        ("luqh/ClinicalT5-base", "t5", True),    # HF Flax weights
+        ("emilyalsentzer/Bio_ClinicalBERT", "bert", False),
+        ("allenai/biomed_roberta_base", "bert", False),
+        ("sentence-transformers/all-mpnet-base-v2", "bert", False),
+    ])
+    return cand
 
 HIGH_VALUE_SECTIONS = [
     "brief hospital course", "hospital course", "discharge diagnosis",
@@ -175,7 +187,7 @@ def load_encoder(device: torch.device):
     """
     from transformers import (AutoModel, AutoTokenizer, T5EncoderModel)
 
-    for model_name, mtype, try_flax in MODEL_CANDIDATES:
+    for model_name, mtype, try_flax in _model_candidates():
         logger.info("Trying %s ...", model_name)
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
