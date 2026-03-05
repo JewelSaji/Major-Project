@@ -40,7 +40,9 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-BASE_MODEL = "luqh/ClinicalT5-base"
+MODEL_ENV = os.getenv("CLINICAL_T5_MODEL")
+BASE_MODEL = MODEL_ENV or "luqh/ClinicalT5-base"
+FALLBACK_BASE_MODEL = os.getenv("CLINICAL_T5_FALLBACK_MODEL", "t5-base")
 MAX_TRAIN_SAMPLES = 60_000
 MAX_TEXT_CHARS = 3000
 MIN_TEXT_LEN = 80
@@ -59,6 +61,11 @@ FINETUNE_DIR = os.path.join(MODELS_DIR, "clinical_t5_finetuned")
 ADAPTER_DIR = os.path.join(FINETUNE_DIR, "adapter")
 ENCODER_DIR = os.path.join(FINETUNE_DIR, "encoder")
 INFO_JSON = os.path.join(FINETUNE_DIR, "info.json")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_CT5_CANDIDATES = [
+    os.path.join(PROJECT_ROOT, "physionet.org", "files", "clinical-t5", "1.0.0", "Clinical-T5-Base"),
+    os.path.join(PROJECT_ROOT, "data", "physionet.org", "files", "clinical-t5", "1.0.0", "Clinical-T5-Base"),
+]
 
 SECTIONS = [
     "brief hospital course", "hospital course", "discharge diagnosis",
@@ -104,6 +111,28 @@ def _corrupt(text: str) -> str:
     if len(kept) < 10:
         kept = words[:]
     return " ".join(kept)
+
+
+def _has_model_weights(model_dir: str) -> bool:
+    if not os.path.isdir(model_dir):
+        return False
+    if not os.path.exists(os.path.join(model_dir, "config.json")):
+        return False
+    for fn in ("pytorch_model.bin", "model.safetensors", "flax_model.msgpack"):
+        if os.path.exists(os.path.join(model_dir, fn)):
+            return True
+    return False
+
+
+def _select_base_model() -> str:
+    # Explicit user setting always wins.
+    if MODEL_ENV:
+        return MODEL_ENV
+    for cand in LOCAL_CT5_CANDIDATES:
+        if _has_model_weights(cand):
+            logger.info("Using local ClinicalT5 weights from %s", cand)
+            return cand
+    return BASE_MODEL
 
 
 def build_file_index(dirs: List[str]) -> Dict[str, str]:
@@ -158,16 +187,81 @@ class Tokenized:
         model_inputs = self.tokenizer(
             src, max_length=MAX_INPUT_LEN, truncation=True, padding=False
         )
-        with self.tokenizer.as_target_tokenizer():
+        # Newer transformers removed `as_target_tokenizer`; use `text_target`
+        # when available and keep a fallback for older versions.
+        try:
             labels = self.tokenizer(
-                tgt, max_length=MAX_TARGET_LEN, truncation=True, padding=False
+                text_target=tgt,
+                max_length=MAX_TARGET_LEN,
+                truncation=True,
+                padding=False,
             )
-        model_inputs["labels"] = labels["input_ids"]
+        except TypeError:
+            if hasattr(self.tokenizer, "as_target_tokenizer"):
+                with self.tokenizer.as_target_tokenizer():
+                    labels = self.tokenizer(
+                        tgt, max_length=MAX_TARGET_LEN, truncation=True, padding=False
+                    )
+            else:
+                labels = self.tokenizer(
+                    text_target=tgt, max_length=MAX_TARGET_LEN, truncation=True, padding=False
+                )
+            model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
 
-def export_merged_encoder(merged_seq2seq: T5ForConditionalGeneration, tokenizer: AutoTokenizer) -> None:
-    encoder = T5EncoderModel.from_pretrained(BASE_MODEL, from_flax=True)
+def _load_t5_seq2seq(model_name: str) -> tuple[T5ForConditionalGeneration, str]:
+    kwargs = {
+        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+    }
+    # Try native PyTorch/safetensors first.
+    try:
+        return T5ForConditionalGeneration.from_pretrained(model_name, **kwargs), model_name
+    except OSError as e:
+        if "does not appear to have a file named" not in str(e):
+            raise
+    # Then try Flax conversion if the repo is Flax-only.
+    try:
+        return T5ForConditionalGeneration.from_pretrained(model_name, from_flax=True, **kwargs), model_name
+    except OSError as e:
+        if "does not appear to have a file named" not in str(e):
+            raise
+        # Final fallback to a known-good T5 checkpoint.
+        logger.warning(
+            "Model '%s' has no usable weights on HF; falling back to '%s'.",
+            model_name,
+            FALLBACK_BASE_MODEL,
+        )
+        return (
+            T5ForConditionalGeneration.from_pretrained(FALLBACK_BASE_MODEL, **kwargs),
+            FALLBACK_BASE_MODEL,
+        )
+
+
+def _load_t5_encoder(model_name: str) -> T5EncoderModel:
+    kwargs = {
+        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+    }
+    try:
+        return T5EncoderModel.from_pretrained(model_name, **kwargs)
+    except OSError:
+        try:
+            return T5EncoderModel.from_pretrained(model_name, from_flax=True, **kwargs)
+        except OSError:
+            logger.warning(
+                "Encoder '%s' not loadable; using fallback encoder '%s'.",
+                model_name,
+                FALLBACK_BASE_MODEL,
+            )
+            return T5EncoderModel.from_pretrained(FALLBACK_BASE_MODEL, **kwargs)
+
+
+def export_merged_encoder(
+    merged_seq2seq: T5ForConditionalGeneration,
+    tokenizer: AutoTokenizer,
+    source_model_name: str,
+) -> None:
+    encoder = _load_t5_encoder(source_model_name)
     full_state = merged_seq2seq.state_dict()
     enc_state = {k.replace("encoder.", "", 1): v for k, v in full_state.items() if k.startswith("encoder.")}
     missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
@@ -193,12 +287,21 @@ def main():
     train_ds = split["train"]
     val_ds = split["test"]
 
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-    base_model = T5ForConditionalGeneration.from_pretrained(
-        BASE_MODEL,
-        from_flax=True,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    )
+    requested_model = _select_base_model()
+    resolved_model_name = requested_model
+    tokenizer = AutoTokenizer.from_pretrained(requested_model)
+    try:
+        base_model, resolved_model_name = _load_t5_seq2seq(requested_model)
+    except Exception:
+        # If tokenizer/model pair is inconsistent in the source repo, use fallback both sides.
+        resolved_model_name = FALLBACK_BASE_MODEL
+        logger.warning(
+            "Tokenizer/model load mismatch for '%s'; using tokenizer+model from '%s'.",
+            requested_model,
+            FALLBACK_BASE_MODEL,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(FALLBACK_BASE_MODEL)
+        base_model, resolved_model_name = _load_t5_seq2seq(FALLBACK_BASE_MODEL)
 
     peft_cfg = LoraConfig(
         task_type=TaskType.SEQ_2_SEQ_LM,
@@ -252,12 +355,14 @@ def main():
     logger.info("LoRA adapter saved to %s", ADAPTER_DIR)
 
     merged = model.merge_and_unload()
-    export_merged_encoder(merged, tokenizer)
+    export_merged_encoder(merged, tokenizer, resolved_model_name)
 
     with open(INFO_JSON, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "base_model": BASE_MODEL,
+                "base_model_requested": BASE_MODEL,
+                "base_model_selected": requested_model,
+                "base_model_resolved": resolved_model_name,
                 "adapter_dir": ADAPTER_DIR,
                 "encoder_dir": ENCODER_DIR,
                 "epochs": TRAIN_EPOCHS,
