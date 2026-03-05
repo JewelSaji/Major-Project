@@ -118,14 +118,28 @@ def composite_rank_score(y_true: np.ndarray, probs: np.ndarray, alpha: Optional[
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
-                         FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
-                         RANDOM_STATE, RESULTS_DIR)
+    from .config import (
+        EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+        RANDOM_STATE, RESULTS_DIR,
+        TRAIN_OPTUNA_TRIALS, TRAIN_N_FOLDS, TRAIN_DART_MAX_TREES,
+        TRAIN_TEST_FRAC, TRAIN_VAL_FRAC, TRAIN_SMOTE_RATIO,
+        TRAIN_BLEND_TRIALS, TRAIN_CT5_KEEP_DIMS, TRAIN_FEATURE_SUBSETS,
+        TRAIN_META_C_CANDIDATES, TRAIN_THRESHOLD_STRATEGY,
+        TRAIN_OPTIMIZE_AUROC, TRAIN_HPO_ALPHA_AUPRC,
+    )
     from .plot_style import apply_publication_style, save_publication_figure
 except ImportError:
-    from config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
-                        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
-                        RANDOM_STATE, RESULTS_DIR)
+    from config import (
+        EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+        RANDOM_STATE, RESULTS_DIR,
+        TRAIN_OPTUNA_TRIALS, TRAIN_N_FOLDS, TRAIN_DART_MAX_TREES,
+        TRAIN_TEST_FRAC, TRAIN_VAL_FRAC, TRAIN_SMOTE_RATIO,
+        TRAIN_BLEND_TRIALS, TRAIN_CT5_KEEP_DIMS, TRAIN_FEATURE_SUBSETS,
+        TRAIN_META_C_CANDIDATES, TRAIN_THRESHOLD_STRATEGY,
+        TRAIN_OPTIMIZE_AUROC, TRAIN_HPO_ALPHA_AUPRC,
+    )
     from plot_style import apply_publication_style, save_publication_figure
 
 # Logging to both console and file
@@ -145,25 +159,25 @@ apply_publication_style()
 
 SELECTED_FEATURES_JSON = os.path.join(MODELS_DIR, "selected_features.json")
 
-# -- TUNABLE CONSTANTS ----------------------------------------------------------
-OPTUNA_TRIALS = 35    # AUROC-focused search; increase for better parameter fit
-N_FOLDS       = 5     # patient-level CV folds
-DART_MAX_TREES = 800  # cap dart trees — early stopping doesn't work with dart
-ENABLE_STACK  = False  # Keep architecture aligned with ClinicalT5 + LightGBM
-ENABLE_SMOTE  = CFG_ENABLE_SMOTE  # SMOTETomek oversampling toggle from config.py
-TEST_FRAC     = 0.15  # fraction of patients in test set
-VAL_FRAC      = 0.15  # fraction of patients in validation set
-USE_TEMPORAL_SPLIT = False  # False = random patient split (often higher AUROC)
-ENABLE_WEIGHTED_BLEND = True  # optimize non-negative blend weights on val
-THRESHOLD_STRATEGY = "mcc"  # f1 | recall80 | j | mcc
-HPO_ALPHA_AUPRC = 0.35  # used only when OPTIMIZE_FOR_AUROC=False
-OPTIMIZE_FOR_AUROC = True
-BLEND_SEARCH_TRIALS = 500
+# -- TUNABLE CONSTANTS (all sourced from config.py — edit there to tune) --------
+OPTUNA_TRIALS            = TRAIN_OPTUNA_TRIALS
+N_FOLDS                  = TRAIN_N_FOLDS
+DART_MAX_TREES           = TRAIN_DART_MAX_TREES
+ENABLE_STACK             = False   # Keep architecture: ClinicalT5 + LightGBM only
+ENABLE_SMOTE             = CFG_ENABLE_SMOTE
+TEST_FRAC                = TRAIN_TEST_FRAC
+VAL_FRAC                 = TRAIN_VAL_FRAC
+USE_TEMPORAL_SPLIT       = False   # False = random patient split (often higher AUROC)
+ENABLE_WEIGHTED_BLEND    = True
+THRESHOLD_STRATEGY       = TRAIN_THRESHOLD_STRATEGY
+HPO_ALPHA_AUPRC          = TRAIN_HPO_ALPHA_AUPRC
+OPTIMIZE_FOR_AUROC       = TRAIN_OPTIMIZE_AUROC
+BLEND_SEARCH_TRIALS      = TRAIN_BLEND_TRIALS
 ENABLE_CT5_DIM_SELECTION = True
-CT5_KEEP_DIMS = 96  # keep top-variance ct5_k dimensions (numeric ct5_* only)
-USE_SELECTED_FEATURES_JSON = False  # ignore legacy selected_features.json by default
+CT5_KEEP_DIMS            = TRAIN_CT5_KEEP_DIMS
+USE_SELECTED_FEATURES_JSON = False
 ENABLE_AUTO_FEATURE_SUBSET = True
-FEATURE_SUBSET_CANDIDATES = [96, 128, 160, 220, 300]
+FEATURE_SUBSET_CANDIDATES  = TRAIN_FEATURE_SUBSETS
 
 
 # ==============================================================================
@@ -358,12 +372,10 @@ def apply_smote(X_tr: np.ndarray, y_tr: np.ndarray) -> Tuple[np.ndarray, np.ndar
         )
         sm = SMOTETomek(
             smote=SMOTE(
-                sampling_strategy=0.35,  # oversample to 35% minority
+                sampling_strategy=TRAIN_SMOTE_RATIO,
                 random_state=RANDOM_STATE,
-                # n_jobs removed: not supported in older imbalanced-learn versions
             ),
             random_state=RANDOM_STATE,
-            # n_jobs removed from SMOTETomek: use fit_resample instead
         )
         X_res, y_res = sm.fit_resample(X_tr, y_tr)
         logger.info(
@@ -734,7 +746,7 @@ def fit_meta_learner(
     best_meta_score = -np.inf
     best_meta_val = None
     best_meta_te = None
-    for c in [0.3, 1.0, 3.0, 10.0]:
+    for c in TRAIN_META_C_CANDIDATES:
         meta = LogisticRegression(C=c, max_iter=2000, random_state=RANDOM_STATE)
         meta.fit(val_stack, y_val)
         p_val = meta.predict_proba(val_stack)[:, 1]

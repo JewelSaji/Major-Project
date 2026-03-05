@@ -36,11 +36,21 @@ warnings.filterwarnings("ignore")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import (DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
-                         FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE)
+    from .config import (
+        DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
+        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE,
+        EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
+        EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
+        EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+    )
 except ImportError:
-    from config import (DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
-                        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE)
+    from config import (
+        DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
+        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE,
+        EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
+        EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
+        EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,16 +62,16 @@ FINETUNED_ENCODER_DIR = os.path.join(
     "encoder",
 )
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-EMBEDDING_DIM   = 256          # final PCA dimension (higher text capacity)
-MAX_SEQ_LEN     = 512
-GPU_BATCH       = 4            # safe for 3050 8GB
-CPU_BATCH       = 8
-MIN_TEXT_LEN    = 50
-MAX_TEXT_CHARS  = 5000         # chars per admission
-CHUNK_WORDS     = 220
-CHUNK_OVERLAP   = 40
-MAX_CHUNKS_PER_NOTE = 6
+# ── CONFIG (all values sourced from config.py) ───────────────────────────────
+EMBEDDING_DIM       = EMBED_DIM
+MAX_SEQ_LEN         = EMBED_MAX_SEQ_LEN
+GPU_BATCH           = EMBED_GPU_BATCH
+CPU_BATCH           = EMBED_CPU_BATCH
+MIN_TEXT_LEN        = EMBED_MIN_TEXT_LEN
+MAX_TEXT_CHARS      = EMBED_MAX_CHARS
+CHUNK_WORDS         = EMBED_CHUNK_WORDS
+CHUNK_OVERLAP       = EMBED_CHUNK_OVERLAP
+MAX_CHUNKS_PER_NOTE = EMBED_MAX_CHUNKS
 
 def _model_candidates() -> List[tuple]:
     # Prioritize local fine-tuned encoder if available.

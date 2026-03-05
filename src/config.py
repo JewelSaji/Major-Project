@@ -11,9 +11,9 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results")
 FIGURES_DIR = os.path.join(BASE_DIR, "figures")
 
 # MIMIC-IV Raw Data Sources (External)
-MIMIC_IV_DIR = r"C:\INTERNSHIP_COURSES\Final-Project\physionet.org\files\mimiciv\3.1"
-MIMIC_NOTE_DIR = r"C:\INTERNSHIP_COURSES\Final-Project\physionet.org\files\mimic-iv-note\2.2"
-MIMIC_BHC_DIR = r"C:\INTERNSHIP_COURSES\Final-Project\physionet.org\files\mimic-iv-ext-bhc-labeled-clinical-notes-dataset-for-hospital-course-summarization-1.2.0"
+MIMIC_IV_DIR = "/home/csnn04/S8-MP/Major-Project/readmission-ai/data/physionet.org/files/mimiciv/3.1"
+MIMIC_NOTE_DIR = "/home/csnn04/S8-MP/Major-Project/readmission-ai/data/physionet.org/files/mimic-iv-note/2.2"
+MIMIC_BHC_DIR = "/home/csnn04/S8-MP/Major-Project/readmission-ai/data/physionet.org/files/mimic-iv-ext-bhc-labeled-clinical-notes-dataset-for-hospital-course-summarization-1.2.0"
 
 # Note: MIMIC_NOTE_PATH is typically found in MIMIC_NOTE_DIR/note/discharge.csv.gz
 
@@ -87,3 +87,132 @@ DEFAULTS = {
 API_HOST = "0.0.0.0"
 API_PORT = 8000
 CORS_ORIGINS = ["*"]
+
+# ========================================
+# 5. EXTRACTION SETTINGS  (01_extract.py)
+# ========================================
+# Sample limit — None = full ~546k admissions; set an int for fast test runs
+N_SAMPLES       = None
+
+# How many top pivot categories to keep as binary features.
+# Larger values = more features = potentially higher recall but slower training.
+TOP_DX_CATS  = 50    # ICD-9/10 3-char diagnosis categories
+TOP_PROC     = 80    # ICD procedure codes
+TOP_MED      = 80    # EMAR medication names
+
+# Clinical threshold flags — directly affect binary engineered features used by the model.
+# Changing these shifts the decision boundary for downstream risk flags.
+VITALS_HYPO_SBP     = 90     # mmHg  — hypotension flag
+VITALS_HYPER_SBP    = 160    # mmHg  — hypertension flag
+VITALS_HYPOXIA_SPO2 = 92     # %     — hypoxia flag
+VITALS_TACHY_HR     = 100    # bpm   — tachycardia flag
+VITALS_BRADY_HR     = 60     # bpm   — bradycardia flag
+VITALS_TACHYPNEA_RR = 20     # /min  — tachypnea flag
+VITALS_FEVER_F      = 100.4  # °F    — fever flag
+VITALS_GCS_LOW      = 10     # score — low GCS flag
+LAB_AKI_CREATININE  = 1.5   # mg/dL — AKI flag
+LAB_HYPERLAC        = 2.0   # mmol/L — hyperlactatemia flag
+LAB_ANEMIA_HGB      = 10.0  # g/dL  — anemia flag
+LAB_LEUKO_HIGH      = 11.0  # 10³/µL — leukocytosis flag
+LAB_LEUKO_LOW       = 4.0   # 10³/µL — leukopenia flag
+LAB_THROMBO_LOW     = 100   # 10³/µL — thrombocytopenia flag
+LAB_HYPONATR        = 135   # mEq/L — hyponatremia flag
+LAB_HYPERNATR       = 145   # mEq/L — hypernatremia flag
+
+# Min occurrence count for a code to be considered as a pivot column contributor.
+# Higher = sparser feature matrix; lower = more features, more noise.
+EXTRACT_MIN_CONTRIB_COUNT = 50
+
+# How many top-correlated features to retain in the final CSV (finalize step).
+# Reducing this cuts dimensionality before embedding fusion.
+EXTRACT_FEATURE_KEEP_TOP  = 500
+
+# ========================================
+# 6. FEATURE SELECTION  (01b_select_features.py)
+# ========================================
+# Number of features to keep after multi-method ranking.
+# Higher = more signal but slower training; lower = more aggressive pruning.
+SELECT_TOP_N        = 160
+
+# CV folds used to average SHAP and gain importances.
+SELECT_N_FOLDS      = 3
+
+# Pearson correlation above this → drop the lower-importance duplicate feature.
+SELECT_CORR_THRESH  = 0.97
+
+# Variance below this → zero-variance filter (pre-selection).
+SELECT_VAR_THRESH   = 1e-8
+
+# Aggregated ranking weights — must sum to 1.0.
+# These determine how much each method drives the final feature ranking.
+SELECT_WEIGHT_SHAP  = 0.5   # SHAP mean |value|
+SELECT_WEIGHT_GAIN  = 0.3   # LightGBM gain importance
+SELECT_WEIGHT_MI    = 0.2   # Mutual information
+
+# Max rows sampled for mutual information (memory-controlled).
+SELECT_MI_SUBSAMPLE = 50_000
+
+# ========================================
+# 7. EMBEDDING SETTINGS  (02_embed.py)
+# ========================================
+# Final PCA output dimension — must match EMBEDDING_DIM above.
+# Increasing this captures more text variance but raises model dimensionality.
+EMBED_DIM           = 128   # ← synced with EMBEDDING_DIM
+
+# Encoding parameters — affect quality vs. speed trade-off for text embeddings.
+EMBED_MAX_SEQ_LEN   = 512   # max tokens fed to the transformer
+EMBED_GPU_BATCH     = 4     # batch size on GPU (tune down if OOM)
+EMBED_CPU_BATCH     = 8
+
+# Note preprocessing — control how much of each clinical note is used.
+EMBED_MIN_TEXT_LEN  = 50    # chars; shorter notes are discarded
+EMBED_MAX_CHARS     = 5_000 # chars per admission (truncation limit)
+EMBED_CHUNK_WORDS   = 220   # words per chunk for long-note splitting
+EMBED_CHUNK_OVERLAP = 40    # word overlap between consecutive chunks
+EMBED_MAX_CHUNKS    = 6     # max chunks per note (limits compute)
+
+# ========================================
+# 8. TRAINING SETTINGS  (03_train.py)
+# ========================================
+# Optuna hyperparameter search — more trials → better HPO, slower run.
+TRAIN_OPTUNA_TRIALS      = 35
+
+# Patient-level GroupKFold splits for cross-validation.
+TRAIN_N_FOLDS            = 5
+
+# Temporal train/val/test split fractions (fractions of unique patients).
+TRAIN_TEST_FRAC          = 0.15
+TRAIN_VAL_FRAC           = 0.15
+
+# SMOTETomek minority class oversample target ratio.
+# Only applied when ENABLE_SMOTE=True. Higher = more synthetic positives.
+TRAIN_SMOTE_RATIO        = 0.35
+
+# Weighted blend optimisation — random search budget over ensemble weights.
+TRAIN_BLEND_TRIALS       = 500
+
+# How many of the highest-variance ct5_* embedding dimensions to keep.
+# Reduces embedding noise; set to EMBED_DIM to keep all.
+TRAIN_CT5_KEEP_DIMS      = 96
+
+# Candidate feature-count subsets evaluated during auto feature selection.
+# The one giving highest val AUROC is chosen.
+TRAIN_FEATURE_SUBSETS    = [96, 128, 160, 220, 300]
+
+# Logistic meta-learner C regularisation search space.
+TRAIN_META_C_CANDIDATES  = [0.3, 1.0, 3.0, 10.0]
+
+# Decision threshold strategy: "f1" | "recall80" | "j" (Youden-J) | "mcc"
+TRAIN_THRESHOLD_STRATEGY = "mcc"
+
+# HPO objective: True = maximise AUROC; False = composite(AUROC, AUPRC).
+TRAIN_OPTIMIZE_AUROC     = True
+
+# AUPRC weight in composite objective (used when TRAIN_OPTIMIZE_AUROC=False).
+TRAIN_HPO_ALPHA_AUPRC    = 0.35
+
+# ========================================
+# 9. ANALYSIS SETTINGS  (05_analyze.py)
+# ========================================
+# Rows sampled for SHAP TreeExplainer — larger = more accurate but slower.
+SHAP_N_SAMPLES = 500
