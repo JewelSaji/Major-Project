@@ -52,7 +52,9 @@ TRAIN_BS = int(os.getenv("CLINICAL_T5_BATCH", "2"))
 GRAD_ACC = int(os.getenv("CLINICAL_T5_GRAD_ACC", "8"))
 RESUME_CHECKPOINTS = os.getenv("CLINICAL_T5_RESUME", "0") == "1"
 STRICT_MODEL_LOAD = os.getenv("CLINICAL_T5_STRICT", "1") == "1"
-LR = 2e-4
+LR = float(os.getenv("CLINICAL_T5_LR", "2e-4"))
+FP16_ENABLED = os.getenv("CLINICAL_T5_FP16", "1") == "1"
+MAX_GRAD_NORM = float(os.getenv("CLINICAL_T5_MAX_GRAD_NORM", "1.0"))
 MAX_INPUT_LEN = 512
 MAX_TARGET_LEN = 192
 LORA_R = 16
@@ -359,7 +361,8 @@ def main():
         "eval_steps": 200,
         "save_steps": 200,
         "save_total_limit": 2,
-        "fp16": torch.cuda.is_available(),
+        "fp16": torch.cuda.is_available() and FP16_ENABLED,
+        "max_grad_norm": MAX_GRAD_NORM,
         "dataloader_num_workers": 0,
         "report_to": [],
         "load_best_model_at_end": False,
