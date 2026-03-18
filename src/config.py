@@ -44,11 +44,12 @@ TEXT_MODEL_CANDIDATES = [
     CLINICAL_T5_BASE_DIR,
     CLINICAL_T5_SCI_DIR,
     "luqh/ClinicalT5-base",
-    "emilyalsentzer/Bio_ClinicalBERT"
+    "emilyalsentzer/Bio_ClinicalBERT",
+    "sentence-transformers/all-mpnet-base-v2",
 ]
 
 # Embedding Settings
-EMBEDDING_DIM = 128
+EMBEDDING_DIM = 512
 TEXT_MAX_LENGTH = 512
 BATCH_SIZE_GPU = 16
 BATCH_SIZE_CPU = 8
@@ -57,7 +58,7 @@ BATCH_SIZE_CPU = 8
 RANDOM_STATE = 42
 
 # 30-Day Readmission Thresholds
-THRESHOLD_HIGH_RISK = 0.7
+THRESHOLD_HIGH_RISK = 0.55
 THRESHOLD_MEDIUM_RISK = 0.4
 
 # Training toggles
@@ -166,7 +167,7 @@ SELECT_MI_SUBSAMPLE = 50_000
 # ========================================
 # Final PCA output dimension — must match EMBEDDING_DIM above.
 # Increasing this captures more text variance but raises model dimensionality.
-EMBED_DIM           = 128   # ← synced with EMBEDDING_DIM
+EMBED_DIM           = 512   # ← synced with EMBEDDING_DIM
 
 # Encoding parameters — affect quality vs. speed trade-off for text embeddings.
 EMBED_MAX_SEQ_LEN   = 512   # max tokens fed to the transformer
@@ -176,9 +177,20 @@ EMBED_CPU_BATCH     = 8
 # Note preprocessing — control how much of each clinical note is used.
 EMBED_MIN_TEXT_LEN  = 50    # chars; shorter notes are discarded
 EMBED_MAX_CHARS     = 5_000 # chars per admission (truncation limit)
-EMBED_CHUNK_WORDS   = 220   # words per chunk for long-note splitting
-EMBED_CHUNK_OVERLAP = 40    # word overlap between consecutive chunks
-EMBED_MAX_CHUNKS    = 6     # max chunks per note (limits compute)
+EMBED_CHUNK_WORDS   = 256   # words per chunk for long-note splitting
+EMBED_CHUNK_OVERLAP = 64    # word overlap between consecutive chunks
+EMBED_MAX_CHUNKS    = 10    # max chunks per note (limits compute)
+
+# Embedding reduction strategy
+EMBEDDING_REDUCTION = "pca"  # "pca" | "umap"
+
+# Multi-model embedding fusion
+EMBED_FUSION_ENABLED = True
+EMBED_FUSION_MODELS = [
+    "finetuned_t5",
+    "emilyalsentzer/Bio_ClinicalBERT",
+    "sentence-transformers/all-mpnet-base-v2",
+]
 
 # ========================================
 # 8. TRAINING SETTINGS  (03_train.py)
@@ -205,7 +217,7 @@ TRAIN_BLEND_TRIALS       = 500
 
 # How many of the highest-variance ct5_* embedding dimensions to keep.
 # Reduces embedding noise; set to EMBED_DIM to keep all.
-TRAIN_CT5_KEEP_DIMS      = 128
+TRAIN_CT5_KEEP_DIMS      = 512
 
 # Candidate feature-count subsets evaluated during auto feature selection.
 # The one giving highest val AUROC is chosen.
@@ -216,6 +228,10 @@ TRAIN_ENABLE_STACK       = True
 
 # Auto feature subset search toggle
 TRAIN_ENABLE_AUTO_FEATURE_SUBSET = False
+
+# Multi-seed ensembling
+TRAIN_SEEDS = [42, 2024, 777]
+TRAIN_HPO_ONCE = True
 
 # Logistic meta-learner C regularisation search space.
 TRAIN_META_C_CANDIDATES  = [0.3, 1.0, 3.0, 10.0]

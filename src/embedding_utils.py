@@ -35,9 +35,14 @@ torch.load = _patched_torch_load
 logger = logging.getLogger(__name__)
 
 # Match 02_embed.py chunking defaults so inference embeddings follow training logic.
-CHUNK_WORDS = 220
-CHUNK_OVERLAP = 40
-MAX_CHUNKS_PER_NOTE = 6
+try:
+    from .config import EMBED_CHUNK_WORDS, EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS
+except Exception:
+    from config import EMBED_CHUNK_WORDS, EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS
+
+CHUNK_WORDS = EMBED_CHUNK_WORDS
+CHUNK_OVERLAP = EMBED_CHUNK_OVERLAP
+MAX_CHUNKS_PER_NOTE = EMBED_MAX_CHUNKS
 BIOCLINICALBERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 
 # ── Config import (works both as package and as direct script) ─────────────────
@@ -153,6 +158,12 @@ class EmbeddingGenerator:
         self._hf_model = None
         self._hf_tokenizer = None
 
+    def _attention_pool(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        scores = hidden.float().mean(dim=-1)
+        scores = scores.masked_fill(attention_mask == 0, -1e9)
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1).type_as(hidden)
+        return (hidden * weights).sum(1)
+
     # ── Info loading ──────────────────────────────────────────────────────────
 
     def _load_model_info(self) -> dict:
@@ -234,8 +245,7 @@ class EmbeddingGenerator:
 
         with torch.no_grad():
             hidden = self._hf_model(**tokens).last_hidden_state
-            mask = tokens["attention_mask"].unsqueeze(-1).float()
-            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            pooled = self._attention_pool(hidden, tokens["attention_mask"])
 
         return pooled.cpu().float().numpy()  # shape (1, 768)
 
@@ -286,8 +296,7 @@ class EmbeddingGenerator:
 
         with torch.no_grad():
             hidden = self._hf_model(**tokens).last_hidden_state
-            mask = tokens["attention_mask"].unsqueeze(-1).float()
-            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            pooled = self._attention_pool(hidden, tokens["attention_mask"])
 
         return pooled.cpu().float().numpy()
 
@@ -310,8 +319,7 @@ class EmbeddingGenerator:
 
         with torch.no_grad():
             hidden = self._hf_model(**tokens).last_hidden_state
-            mask = tokens["attention_mask"].unsqueeze(-1).float()
-            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            pooled = self._attention_pool(hidden, tokens["attention_mask"])
 
         return pooled.cpu().float().numpy()
 
@@ -333,7 +341,7 @@ class EmbeddingGenerator:
             or self.model_info.get("model")
             or "sentence-transformers/all-mpnet-base-v2"
         )
-        pca        = self.model_info.get("pca")          # fitted sklearn PCA or None
+        reducer    = self.model_info.get("reducer") or self.model_info.get("pca")
         scaler     = self.model_info.get("scaler")       # optional StandardScaler
 
         raw_768: np.ndarray = None
@@ -343,6 +351,21 @@ class EmbeddingGenerator:
         # ── Step 1: generate 768-dim raw embedding ────────────────────────
         if has_text:
             try:
+                if method == "multi_fusion":
+                    models = self.model_info.get("models", [])
+                    parts = []
+                    for m in models:
+                        name = m.get("name") if isinstance(m, dict) else m
+                        mtype = m.get("type") if isinstance(m, dict) else None
+                        chunk_vecs = []
+                        for chunk in note_chunks:
+                            if mtype == "t5":
+                                chunk_vecs.append(self._embed_with_t5_hub(chunk, name))
+                            else:
+                                chunk_vecs.append(self._embed_with_hf(chunk, name))
+                        parts.append(np.vstack(chunk_vecs).mean(axis=0, keepdims=True))
+                    raw_768 = np.hstack(parts)
+
                 if method == "sentence_transformers":
                     parts = [self._embed_with_st(chunk, model_name) for chunk in note_chunks]
                     raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
@@ -395,6 +418,18 @@ class EmbeddingGenerator:
             # No clinical note provided. Use dedicated token to stay consistent
             # with training-time missing-note handling in 02_embed.py.
             try:
+                if method == "multi_fusion":
+                    models = self.model_info.get("models", [])
+                    parts = []
+                    for m in models:
+                        name = m.get("name") if isinstance(m, dict) else m
+                        mtype = m.get("type") if isinstance(m, dict) else None
+                        if mtype == "t5":
+                            parts.append(self._embed_with_t5_hub("[NO_NOTE]", name))
+                        else:
+                            parts.append(self._embed_with_hf("[NO_NOTE]", name))
+                    raw_768 = np.hstack(parts)
+
                 if method == "sentence_transformers":
                     raw_768 = self._embed_with_st("[NO_NOTE]", model_name)
                 elif method in ("clinical_t5", "transformer_t5"):
@@ -416,19 +451,27 @@ class EmbeddingGenerator:
             except Exception:
                 raw_768 = np.zeros((1, 768), dtype=np.float32)
 
-        # ── Step 2: apply scaler + PCA (must match 02_embed.py exactly) ──
-        if scaler is not None:
-            try:
-                raw_768 = scaler.transform(raw_768)
-            except Exception as e:
-                logger.warning("Scaler transform failed: %s", e)
+        # ── Step 2: apply reduction (must match 02_embed.py) ─────────────
+        if raw_768 is None:
+            raw_768 = np.zeros((1, EMBEDDING_DIM), dtype=np.float32)
 
-        if pca is not None:
+        # L2 normalize before reduction
+        norm = np.linalg.norm(raw_768, axis=1, keepdims=True)
+        raw_768 = raw_768 / np.clip(norm, 1e-9, None)
+
+        if scaler is not None and reducer is not None:
             try:
-                result = pca.transform(raw_768)[0]  # (128,)
+                result = reducer.transform(scaler.transform(raw_768))[0]
                 return result.astype(np.float32)
             except Exception as e:
-                logger.warning("PCA transform failed: %s", e)
+                logger.warning("Reducer transform failed: %s", e)
+
+        if reducer is not None:
+            try:
+                result = reducer.transform(raw_768)[0]
+                return result.astype(np.float32)
+            except Exception as e:
+                logger.warning("Reducer transform failed: %s", e)
 
         # Fallback: truncate/pad to EMBEDDING_DIM
         vec = raw_768[0]

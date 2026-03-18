@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import normalize, StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -43,6 +43,7 @@ try:
         EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
         EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
         EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+        EMBEDDING_REDUCTION, EMBED_FUSION_ENABLED, EMBED_FUSION_MODELS,
     )
 except ImportError:
     from config import (
@@ -52,6 +53,7 @@ except ImportError:
         EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
         EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
         EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+        EMBEDDING_REDUCTION, EMBED_FUSION_ENABLED, EMBED_FUSION_MODELS,
     )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -95,12 +97,41 @@ def _model_candidates() -> List[tuple]:
     ])
     return cand
 
+
+def _infer_model_type(model_name: str) -> str:
+    name = (model_name or "").lower()
+    if "t5" in name or "clinical_t5" in name or "clinical-t5" in name:
+        return "t5"
+    return "bert"
+
+
+def _resolve_fusion_models() -> List[str]:
+    models = []
+    for m in EMBED_FUSION_MODELS:
+        if m == "finetuned_t5":
+            models.append(FINETUNED_ENCODER_DIR)
+        else:
+            models.append(m)
+    return models
+
+
+def _safe_model_tag(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", name.strip("/"))
+
 HIGH_VALUE_SECTIONS = [
     "brief hospital course", "hospital course", "discharge diagnosis",
     "discharge condition", "assessment and plan", "assessment/plan",
     "pertinent results", "discharge medications", "history of present illness",
     "past medical history", "social history", "discharge disposition",
     "major surgical", "reason for hospitalization",
+    "physical exam", "impression", "consultations", "treatment",
+    "complications", "medications",
+]
+
+BOILERPLATE_PATTERNS = [
+    r"dictated by.*",
+    r"electronically signed.*",
+    r"page\s+\d+\s+of\s+\d+",
 ]
 
 
@@ -112,6 +143,9 @@ def preprocess_note(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
     # Remove MIMIC de-id placeholders
     text = re.sub(r"\[\*\*.*?\*\*\]", " ", text)
     text = text.replace("\r", "\n")
+    # Remove boilerplate lines
+    for pat in BOILERPLATE_PATTERNS:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
 
     # Try extracting high-value sections
     extracted = []
@@ -260,6 +294,42 @@ def load_encoder(device: torch.device):
     raise RuntimeError("All models failed to load.")
 
 
+def load_specific_encoder(device: torch.device, model_name: str, mtype: str = None):
+    """
+    Load a specific encoder (T5 or BERT) for multi-model fusion.
+    """
+    from transformers import (AutoModel, AutoTokenizer, T5EncoderModel)
+
+    resolved_type = mtype or _infer_model_type(model_name)
+    logger.info("Trying %s ...", model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    if resolved_type == "t5":
+        try:
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            ).to(device).eval()
+        except Exception:
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                from_flax=True,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            ).to(device).eval()
+    else:
+        model = AutoModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            low_cpu_mem_usage=True
+        ).to(device).eval()
+
+    logger.info("Loaded %s on %s", model_name, device)
+    return model, tokenizer, resolved_type, model_name
+
+
 from torch.utils.data import Dataset, DataLoader
 
 class NoteDataset(Dataset):
@@ -292,10 +362,13 @@ def encode_batch(model, tokenizer, texts: List[str], device: torch.device,
         out = model(input_ids=input_ids, attention_mask=attention_mask)
 
     hidden = out.last_hidden_state                          # (B, L, H)
-    mask   = attention_mask.unsqueeze(-1).float()
-    pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+    # Attention-weighted pooling (compute scores in fp32 to avoid fp16 overflow)
+    scores = hidden.float().mean(dim=-1)
+    scores = scores.masked_fill(attention_mask == 0, -1e9)
+    weights = torch.softmax(scores, dim=1).unsqueeze(-1).type_as(hidden)
+    pooled = (hidden * weights).sum(1)
     result = pooled.cpu().float().numpy()
-    del input_ids, attention_mask, out, hidden, mask, pooled
+    del input_ids, attention_mask, out, hidden, pooled, weights, scores
     return result
 
 
@@ -419,12 +492,49 @@ class EmbeddingPipeline:
 
         # ── Try transformer encoding ──────────────────────────────────────
         try:
-            model, tokenizer, mtype, model_name_used = load_encoder(device)
             batch_size = GPU_BATCH if device.type == "cuda" else CPU_BATCH
-            logger.info("Encoding %d texts with %s (batch=%d) ...", len(texts), model_name_used, batch_size)
+            models_meta = []
 
-            raw = encode_all(model, tokenizer, texts, device, mtype, batch_size,
-                             cache_dir=os.path.join(DATA_DIR, "embed_cache"))
+            if EMBED_FUSION_ENABLED:
+                raw_list = []
+                for model_name in _resolve_fusion_models():
+                    model, tokenizer, mtype, model_name_used = load_specific_encoder(
+                        device, model_name
+                    )
+                    logger.info(
+                        "Encoding %d texts with %s (batch=%d) ...",
+                        len(texts), model_name_used, batch_size,
+                    )
+                    cache_dir = os.path.join(
+                        DATA_DIR, "embed_cache", f"fusion_{_safe_model_tag(model_name_used)}"
+                    )
+                    raw_i = encode_all(model, tokenizer, texts, device, mtype, batch_size,
+                                       cache_dir=cache_dir)
+                    raw_list.append(raw_i)
+                    models_meta.append({"name": model_name_used, "type": mtype})
+                    del model
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                raw = np.concatenate(raw_list, axis=1)
+                method = "multi_fusion"
+            else:
+                model, tokenizer, mtype, model_name_used = load_encoder(device)
+                logger.info(
+                    "Encoding %d texts with %s (batch=%d) ...",
+                    len(texts), model_name_used, batch_size,
+                )
+                raw = encode_all(model, tokenizer, texts, device, mtype, batch_size,
+                                 cache_dir=os.path.join(DATA_DIR, "embed_cache"))
+                models_meta = [{"name": model_name_used, "type": mtype}]
+                method = f"transformer_{mtype}"
+
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
+
             logger.info("Raw embeddings: %s", raw.shape)
 
             zero_ratio = (raw == 0).mean()
@@ -434,25 +544,33 @@ class EmbeddingPipeline:
             if zero_ratio > 0.9 or var_mean < 1e-7:
                 raise ValueError(f"Poor embedding quality: zero={zero_ratio:.3f}")
 
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-
-            # PCA
-            scaler  = StandardScaler()
-            raw_std = scaler.fit_transform(raw)
+            # L2 normalize before reduction
+            raw_norm = normalize(raw, norm="l2")
             del raw; gc.collect()
 
-            n_comp = min(EMBEDDING_DIM, raw_std.shape[1], raw_std.shape[0]-1)
-            pca    = PCA(n_components=n_comp, random_state=RANDOM_STATE, svd_solver="randomized")
-            embeddings = pca.fit_transform(raw_std).astype(np.float32)
-            logger.info("PCA explained variance: %.1f%%", pca.explained_variance_ratio_.sum()*100)
-            del raw_std; gc.collect()
+            if EMBEDDING_REDUCTION == "pca":
+                n_comp = min(EMBEDDING_DIM, raw_norm.shape[1], raw_norm.shape[0]-1)
+                pca = PCA(n_components=n_comp, random_state=RANDOM_STATE, svd_solver="randomized")
+                embeddings = pca.fit_transform(raw_norm).astype(np.float32)
+                logger.info("PCA explained variance: %.1f%%", pca.explained_variance_ratio_.sum()*100)
+                reducer = pca
+            elif EMBEDDING_REDUCTION == "umap":
+                try:
+                    import umap
+                except Exception as e:
+                    raise RuntimeError("UMAP requested but umap-learn not installed") from e
+                reducer = umap.UMAP(n_components=EMBEDDING_DIM, random_state=RANDOM_STATE)
+                embeddings = reducer.fit_transform(raw_norm).astype(np.float32)
+            else:
+                raise ValueError(f"Unknown EMBEDDING_REDUCTION: {EMBEDDING_REDUCTION}")
 
-            method     = f"transformer_{mtype}"
-            model_info = {"method": method, "model": model_name_used,
-                          "scaler": scaler, "pca": pca, "dim": n_comp}
+            model_info = {
+                "method": method,
+                "models": models_meta,
+                "reduction": EMBEDDING_REDUCTION,
+                "reducer": reducer,
+                "dim": embeddings.shape[1],
+            }
 
         except Exception as e:
             logger.error("Transformer encoding failed: %s", e)
@@ -474,9 +592,10 @@ class EmbeddingPipeline:
             feat_hadm  = ff["hadm_id"].tolist()
             model_info = {"method": "feature_svd", "scaler": scaler, "pca": svd, "dim": n_comp}
             del ff, X, Xs; gc.collect()
-            model_name_used = "feature_svd"
+        method_name = model_info.get("method", "feature_svd")
 
         # ── Save ──────────────────────────────────────────────────────────
+        method_name = model_info.get("method", "unknown")
         n_dims = embeddings.shape[1]
         emb_df = pd.DataFrame(embeddings, columns=[f"ct5_{i}" for i in range(n_dims)])
         # Explicit text-quality signals improve fusion robustness.
@@ -486,7 +605,7 @@ class EmbeddingPipeline:
         emb_df["hadm_id"] = feat_hadm
         emb_df.to_csv(EMBEDDINGS_CSV, index=False)
         joblib.dump(model_info, EMBEDDING_INFO_PKL)
-        logger.info("Saved embeddings → %s (%d dims, method=%s)", EMBEDDINGS_CSV, n_dims, model_name_used)
+        logger.info("Saved embeddings → %s (%d dims, method=%s)", EMBEDDINGS_CSV, n_dims, method_name)
 
 
 if __name__ == "__main__":
