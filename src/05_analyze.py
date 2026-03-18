@@ -21,14 +21,14 @@ import shap
 try:
     from .config import (
         MAIN_MODEL_PKL, FEATURES_CSV, EMBEDDINGS_CSV,
-        FIGURES_DIR, RESULTS_DIR, RANDOM_STATE,
+        FIGURES_DIR, RESULTS_DIR, RANDOM_STATE, SHAP_N_SAMPLES,
     )
     from .embedding_utils import _extract_primary_model
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from config import (
         MAIN_MODEL_PKL, FEATURES_CSV, EMBEDDINGS_CSV,
-        FIGURES_DIR, RESULTS_DIR, RANDOM_STATE,
+        FIGURES_DIR, RESULTS_DIR, RANDOM_STATE, SHAP_N_SAMPLES,
     )
     from embedding_utils import _extract_primary_model
 
@@ -85,7 +85,7 @@ class SHAPAnalyzer:
         logger.info("Resources loaded. Data shape: %s", self.df.shape)
         return self.df
 
-    def analyze(self, n_samples: int = 500):
+    def analyze(self, n_samples: int = SHAP_N_SAMPLES):
         """Runs SHAP TreeExplainer on a random subsample."""
         features = self.model_data["features"]
 
@@ -145,7 +145,7 @@ class SHAPAnalyzer:
         plt.close()
         logger.info("SHAP bar chart saved -> %s", bar_path)
 
-    def run(self, n_samples: int = 500):
+    def run(self, n_samples: int = SHAP_N_SAMPLES):
         self.load_resources()
         shap_vals, X_sample = self.analyze(n_samples=n_samples)
         self.generate_plots(shap_vals, X_sample)

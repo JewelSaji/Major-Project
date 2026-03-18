@@ -42,6 +42,7 @@ OTHER IMPROVEMENTS (v3 vs v2):
 """
 
 import gc
+import random
 import json
 import logging
 import os
@@ -85,6 +86,13 @@ warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)  # suppress Optuna internal noise
 
 
+def _set_seed(seed: int) -> None:
+    global RANDOM_STATE
+    RANDOM_STATE = int(seed)
+    np.random.seed(RANDOM_STATE)
+    random.seed(RANDOM_STATE)
+
+
 def _optuna_callback(study: "optuna.Study", trial: "optuna.trial.FrozenTrial") -> None:
     """Log each completed trial so HPO progress is visible."""
     if trial.value is None:
@@ -118,14 +126,34 @@ def composite_rank_score(y_true: np.ndarray, probs: np.ndarray, alpha: Optional[
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
-                         FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
-                         RANDOM_STATE, RESULTS_DIR)
+    from .config import (
+        EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+        RANDOM_STATE, RESULTS_DIR,
+        TRAIN_OPTUNA_TRIALS, TRAIN_N_FOLDS, TRAIN_DART_MAX_TREES,
+        TRAIN_TEST_FRAC, TRAIN_VAL_FRAC, TRAIN_SMOTE_RATIO,
+        TRAIN_BLEND_TRIALS, TRAIN_CT5_KEEP_DIMS, TRAIN_FEATURE_SUBSETS,
+        TRAIN_META_C_CANDIDATES, TRAIN_THRESHOLD_STRATEGY,
+        TRAIN_ENABLE_STACK,
+        TRAIN_ENABLE_AUTO_FEATURE_SUBSET,
+        TRAIN_SEEDS, TRAIN_HPO_ONCE,
+        TRAIN_OPTIMIZE_AUROC, TRAIN_HPO_ALPHA_AUPRC,
+    )
     from .plot_style import apply_publication_style, save_publication_figure
 except ImportError:
-    from config import (EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
-                        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
-                        RANDOM_STATE, RESULTS_DIR)
+    from config import (
+        EMBEDDINGS_CSV, ENABLE_SMOTE as CFG_ENABLE_SMOTE,
+        FEATURES_CSV, FIGURES_DIR, MAIN_MODEL_PKL, MODELS_DIR,
+        RANDOM_STATE, RESULTS_DIR,
+        TRAIN_OPTUNA_TRIALS, TRAIN_N_FOLDS, TRAIN_DART_MAX_TREES,
+        TRAIN_TEST_FRAC, TRAIN_VAL_FRAC, TRAIN_SMOTE_RATIO,
+        TRAIN_BLEND_TRIALS, TRAIN_CT5_KEEP_DIMS, TRAIN_FEATURE_SUBSETS,
+        TRAIN_META_C_CANDIDATES, TRAIN_THRESHOLD_STRATEGY,
+        TRAIN_ENABLE_STACK,
+        TRAIN_ENABLE_AUTO_FEATURE_SUBSET,
+        TRAIN_SEEDS, TRAIN_HPO_ONCE,
+        TRAIN_OPTIMIZE_AUROC, TRAIN_HPO_ALPHA_AUPRC,
+    )
     from plot_style import apply_publication_style, save_publication_figure
 
 # Logging to both console and file
@@ -145,25 +173,25 @@ apply_publication_style()
 
 SELECTED_FEATURES_JSON = os.path.join(MODELS_DIR, "selected_features.json")
 
-# -- TUNABLE CONSTANTS ----------------------------------------------------------
-OPTUNA_TRIALS = 35    # AUROC-focused search; increase for better parameter fit
-N_FOLDS       = 5     # patient-level CV folds
-DART_MAX_TREES = 800  # cap dart trees — early stopping doesn't work with dart
-ENABLE_STACK  = False  # Keep architecture aligned with ClinicalT5 + LightGBM
-ENABLE_SMOTE  = CFG_ENABLE_SMOTE  # SMOTETomek oversampling toggle from config.py
-TEST_FRAC     = 0.15  # fraction of patients in test set
-VAL_FRAC      = 0.15  # fraction of patients in validation set
-USE_TEMPORAL_SPLIT = False  # False = random patient split (often higher AUROC)
-ENABLE_WEIGHTED_BLEND = True  # optimize non-negative blend weights on val
-THRESHOLD_STRATEGY = "mcc"  # f1 | recall80 | j | mcc
-HPO_ALPHA_AUPRC = 0.35  # used only when OPTIMIZE_FOR_AUROC=False
-OPTIMIZE_FOR_AUROC = True
-BLEND_SEARCH_TRIALS = 500
+# -- TUNABLE CONSTANTS (all sourced from config.py — edit there to tune) --------
+OPTUNA_TRIALS            = TRAIN_OPTUNA_TRIALS
+N_FOLDS                  = TRAIN_N_FOLDS
+DART_MAX_TREES           = TRAIN_DART_MAX_TREES
+ENABLE_STACK             = TRAIN_ENABLE_STACK
+ENABLE_SMOTE             = CFG_ENABLE_SMOTE
+TEST_FRAC                = TRAIN_TEST_FRAC
+VAL_FRAC                 = TRAIN_VAL_FRAC
+USE_TEMPORAL_SPLIT       = False   # False = random patient split (often higher AUROC)
+ENABLE_WEIGHTED_BLEND    = True
+THRESHOLD_STRATEGY       = TRAIN_THRESHOLD_STRATEGY
+HPO_ALPHA_AUPRC          = TRAIN_HPO_ALPHA_AUPRC
+OPTIMIZE_FOR_AUROC       = TRAIN_OPTIMIZE_AUROC
+BLEND_SEARCH_TRIALS      = TRAIN_BLEND_TRIALS
 ENABLE_CT5_DIM_SELECTION = True
-CT5_KEEP_DIMS = 96  # keep top-variance ct5_k dimensions (numeric ct5_* only)
-USE_SELECTED_FEATURES_JSON = False  # ignore legacy selected_features.json by default
-ENABLE_AUTO_FEATURE_SUBSET = True
-FEATURE_SUBSET_CANDIDATES = [96, 128, 160, 220, 300]
+CT5_KEEP_DIMS            = TRAIN_CT5_KEEP_DIMS
+USE_SELECTED_FEATURES_JSON = False
+ENABLE_AUTO_FEATURE_SUBSET = TRAIN_ENABLE_AUTO_FEATURE_SUBSET
+FEATURE_SUBSET_CANDIDATES  = TRAIN_FEATURE_SUBSETS
 
 
 # ==============================================================================
@@ -358,12 +386,10 @@ def apply_smote(X_tr: np.ndarray, y_tr: np.ndarray) -> Tuple[np.ndarray, np.ndar
         )
         sm = SMOTETomek(
             smote=SMOTE(
-                sampling_strategy=0.35,  # oversample to 35% minority
+                sampling_strategy=TRAIN_SMOTE_RATIO,
                 random_state=RANDOM_STATE,
-                # n_jobs removed: not supported in older imbalanced-learn versions
             ),
             random_state=RANDOM_STATE,
-            # n_jobs removed from SMOTETomek: use fit_resample instead
         )
         X_res, y_res = sm.fit_resample(X_tr, y_tr)
         logger.info(
@@ -734,7 +760,7 @@ def fit_meta_learner(
     best_meta_score = -np.inf
     best_meta_val = None
     best_meta_te = None
-    for c in [0.3, 1.0, 3.0, 10.0]:
+    for c in TRAIN_META_C_CANDIDATES:
         meta = LogisticRegression(C=c, max_iter=2000, random_state=RANDOM_STATE)
         meta.fit(val_stack, y_val)
         p_val = meta.predict_proba(val_stack)[:, 1]
@@ -1069,7 +1095,9 @@ class TRANCETrainer:
         self.best_params:    Dict = {}
         self.best_threshold: float = 0.5
 
-    def run(self) -> Dict:
+    def _run_single(self, seed: int, best_params: Optional[Dict] = None,
+                    do_hpo: bool = True, do_artifacts: bool = True) -> Dict[str, object]:
+        _set_seed(seed)
         # -- 1. Load -------------------------------------------------------
         X, y, groups = load_data()
         self.features = list(X.columns)
@@ -1141,10 +1169,13 @@ class TRANCETrainer:
             X_tr, y_tr = apply_smote(X_tr, y_tr)
 
         # -- 4. HPO --------------------------------------------------------
-        self.best_params = optimize_lgbm(
-            X_tr, y_tr, X_val, y_val,
-            pos_weight, n_trials=OPTUNA_TRIALS,
-        )
+        if do_hpo or best_params is None:
+            self.best_params = optimize_lgbm(
+                X_tr, y_tr, X_val, y_val,
+                pos_weight, n_trials=OPTUNA_TRIALS,
+            )
+        else:
+            self.best_params = best_params
 
         # -- 5. Patient-level CV -------------------------------------------
         X_tv      = X[train_mask | val_mask]
@@ -1217,34 +1248,37 @@ class TRANCETrainer:
         # -- 11. Ablation --------------------------------------------------
         X_df_tr  = pd.DataFrame(np.vstack([X_tr, X_val]), columns=self.features)
         X_df_te  = pd.DataFrame(X_te, columns=self.features)
-        ablation = run_ablation(
-            X_df_tr, pd.Series(np.concatenate([y_tr, y_val])),
-            X_df_te, pd.Series(y_te),
-            self.best_params,
-        )
+        ablation = {}
+        if do_artifacts:
+            ablation = run_ablation(
+                X_df_tr, pd.Series(np.concatenate([y_tr, y_val])),
+                X_df_te, pd.Series(y_te),
+                self.best_params,
+            )
 
         # -- 12. SHAP ------------------------------------------------------
-        primary = next((m for n, m in self.models if n == "lgbm"), None)
-        if primary is not None:
-            n_shap = min(3000, len(X_te))
-            idx    = np.random.RandomState(RANDOM_STATE).choice(
-                len(X_te), n_shap, replace=False
-            )
-            compute_shap(primary, pd.DataFrame(X_te[idx], columns=self.features))
+        if do_artifacts:
+            primary = next((m for n, m in self.models if n == "lgbm"), None)
+            if primary is not None:
+                n_shap = min(3000, len(X_te))
+                idx    = np.random.RandomState(RANDOM_STATE).choice(
+                    len(X_te), n_shap, replace=False
+                )
+                compute_shap(primary, pd.DataFrame(X_te[idx], columns=self.features))
 
-        # -- 13. Plots -----------------------------------------------------
-        save_plots(y_te, test_probs_raw, test_probs_cal, self.best_threshold)
+            # -- 13. Plots -----------------------------------------------------
+            save_plots(y_te, test_probs_raw, test_probs_cal, self.best_threshold)
 
-        # -- 14. Predictions CSV -------------------------------------------
-        pred_df = pd.DataFrame({
-            "y_true":   y_te,
-            "prob_raw": test_probs_raw.round(6),
-            "prob_cal": test_probs_cal.round(6),
-            "pred":     test_preds,
-        })
-        pred_path = os.path.join(RESULTS_DIR, "test_predictions.csv")
-        pred_df.to_csv(pred_path, index=False)
-        logger.info("Predictions saved -> %s", pred_path)
+            # -- 14. Predictions CSV -------------------------------------------
+            pred_df = pd.DataFrame({
+                "y_true":   y_te,
+                "prob_raw": test_probs_raw.round(6),
+                "prob_cal": test_probs_cal.round(6),
+                "pred":     test_preds,
+            })
+            pred_path = os.path.join(RESULTS_DIR, "test_predictions.csv")
+            pred_df.to_csv(pred_path, index=False)
+            logger.info("Predictions saved -> %s", pred_path)
 
         # -- 15. Save model + report ---------------------------------------
         results = {
@@ -1291,6 +1325,114 @@ class TRANCETrainer:
         except Exception as e:
             logger.warning("Could not compute feature means: %s", e)
             self._X_train_means = {}
+
+        results.update({
+            "seed": seed,
+            "val_probs_raw": val_probs_for_cal,
+            "test_probs_raw": test_probs_raw,
+            "y_val": y_val,
+            "y_te": y_te,
+            "cv_auroc_mean": cv_mean,
+            "cv_auroc_std": cv_std,
+            "stack_info": stack_info,
+        })
+        return results
+
+    def run(self) -> Dict:
+        seeds = TRAIN_SEEDS or [RANDOM_STATE]
+        seed_results: List[Dict[str, object]] = []
+        best_params = None
+
+        for i, seed in enumerate(seeds):
+            logger.info("=== Training seed %s (%d/%d) ===", seed, i + 1, len(seeds))
+            res = self._run_single(
+                seed=seed,
+                best_params=best_params,
+                do_hpo=(i == 0 or not TRAIN_HPO_ONCE),
+                do_artifacts=(i == 0),
+            )
+            if best_params is None:
+                best_params = res.get("best_params")
+            seed_results.append(res)
+
+        if len(seed_results) == 1:
+            final = seed_results[0]
+            self._save(final)
+            return final
+
+        # Average predictions across seeds
+        y_val = seed_results[0]["y_val"]
+        y_te  = seed_results[0]["y_te"]
+        val_probs_raw = np.mean([r["val_probs_raw"] for r in seed_results], axis=0)
+        test_probs_raw = np.mean([r["test_probs_raw"] for r in seed_results], axis=0)
+
+        self.calibrator, test_probs_cal, calibration_method = calibrate(
+            val_probs_raw, y_val, test_probs_raw
+        )
+        val_probs_cal = self.calibrator.predict(val_probs_raw).astype(np.float32)
+
+        self.best_threshold = find_best_threshold(
+            val_probs_cal, y_val, strategy=THRESHOLD_STRATEGY
+        )
+
+        auc_raw  = roc_auc_score(y_te, test_probs_raw)
+        auc_cal  = roc_auc_score(y_te, test_probs_cal)
+        auprc    = average_precision_score(y_te, test_probs_cal)
+        brier    = brier_score_loss(y_te, test_probs_cal)
+        ll       = log_loss(y_te, test_probs_cal)
+
+        test_preds = (test_probs_cal >= self.best_threshold).astype(int)
+        report     = classification_report(y_te, test_preds, output_dict=True,
+                                           zero_division=0)
+        recall_pos = report.get("1", {}).get("recall",    0.0)
+        prec_pos   = report.get("1", {}).get("precision", 0.0)
+        f1_pos     = report.get("1", {}).get("f1-score",  0.0)
+        mcc_pos    = matthews_corrcoef(y_te, test_preds)
+        op_points  = summarize_operating_points(y_val, val_probs_cal, y_te, test_probs_cal)
+
+        results = {
+            "auroc_raw":          round(auc_raw,   4),
+            "auroc_calibrated":   round(auc_cal,   4),
+            "auprc":              round(auprc,      4),
+            "brier_score":        round(brier,      4),
+            "log_loss":           round(ll,         4),
+            "cv_auroc_mean":      round(np.mean([r["cv_auroc_mean"] for r in seed_results]), 4),
+            "cv_auroc_std":       round(np.mean([r["cv_auroc_std"] for r in seed_results]), 4),
+            "best_threshold":     round(self.best_threshold, 3),
+            "threshold_strategy": THRESHOLD_STRATEGY,
+            "calibration_method": calibration_method,
+            "smote_enabled": ENABLE_SMOTE,
+            "feature_subset": seed_results[0].get("feature_subset", {"enabled": False}),
+            "recall_readmit1":    round(recall_pos, 4),
+            "precision_readmit1": round(prec_pos,   4),
+            "f1_readmit1":        round(f1_pos,     4),
+            "mcc_readmit1":       round(mcc_pos,    4),
+            "operating_points":   op_points,
+            "stacking":           seed_results[0].get("stack_info", {}),
+            "ablation":           seed_results[0].get("ablation", {}),
+            "n_models":           seed_results[0].get("n_models", 0),
+            "n_features":         seed_results[0].get("n_features", 0),
+            "train_size":         seed_results[0].get("train_size", 0),
+            "val_size":           seed_results[0].get("val_size", 0),
+            "test_size":          seed_results[0].get("test_size", 0),
+            "best_params": {
+                k: (str(v) if not isinstance(v, (int, float, bool, str, type(None))) else v)
+                for k, v in (best_params or {}).items()
+            },
+            "timestamp": datetime.now().isoformat(),
+            "seeds": seeds,
+        }
+
+        # Save averaged predictions
+        pred_df = pd.DataFrame({
+            "y_true":   y_te,
+            "prob_raw": test_probs_raw.round(6),
+            "prob_cal": test_probs_cal.round(6),
+            "pred":     test_preds,
+        })
+        pred_path = os.path.join(RESULTS_DIR, "test_predictions.csv")
+        pred_df.to_csv(pred_path, index=False)
+        logger.info("Predictions saved -> %s", pred_path)
 
         self._save(results)
         return results

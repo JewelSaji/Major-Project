@@ -29,21 +29,37 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 try:
-    from .config import DATA_DIR, FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_IV_DIR, MIMIC_NOTE_DIR
+    from .config import (
+        DATA_DIR, FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_IV_DIR, MIMIC_NOTE_DIR,
+        N_SAMPLES, TOP_DX_CATS, TOP_PROC, TOP_MED,
+        EXTRACT_MIN_CONTRIB_COUNT, EXTRACT_FEATURE_KEEP_TOP,
+        VITALS_HYPO_SBP, VITALS_HYPER_SBP, VITALS_HYPOXIA_SPO2,
+        VITALS_TACHY_HR, VITALS_BRADY_HR, VITALS_TACHYPNEA_RR,
+        VITALS_FEVER_F, VITALS_GCS_LOW,
+        LAB_AKI_CREATININE, LAB_HYPERLAC, LAB_ANEMIA_HGB,
+        LAB_LEUKO_HIGH, LAB_LEUKO_LOW, LAB_THROMBO_LOW,
+        LAB_HYPONATR, LAB_HYPERNATR,
+    )
 except ImportError:
-    from config import DATA_DIR, FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_IV_DIR, MIMIC_NOTE_DIR
+    from config import (
+        DATA_DIR, FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_IV_DIR, MIMIC_NOTE_DIR,
+        N_SAMPLES, TOP_DX_CATS, TOP_PROC, TOP_MED,
+        EXTRACT_MIN_CONTRIB_COUNT, EXTRACT_FEATURE_KEEP_TOP,
+        VITALS_HYPO_SBP, VITALS_HYPER_SBP, VITALS_HYPOXIA_SPO2,
+        VITALS_TACHY_HR, VITALS_BRADY_HR, VITALS_TACHYPNEA_RR,
+        VITALS_FEVER_F, VITALS_GCS_LOW,
+        LAB_AKI_CREATININE, LAB_HYPERLAC, LAB_ANEMIA_HGB,
+        LAB_LEUKO_HIGH, LAB_LEUKO_LOW, LAB_THROMBO_LOW,
+        LAB_HYPONATR, LAB_HYPERNATR,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-N_SAMPLES    = None        # None = full ~546k admissions; set int for quick test
+# ── I/O CHUNK SIZES (memory-management only) ─────────────────────────────────
 LAB_CHUNK    = 3_000_000
 CHART_CHUNK  = 2_000_000
 EMAR_CHUNK   = 1_000_000
-TOP_DX_CATS  = 50          # ICD 3-char categories
-TOP_PROC     = 80
-TOP_MED      = 80
 
 VITAL_ITEMS = {
     220045: "hr",    220179: "sbp",   220180: "dbp",
@@ -130,7 +146,7 @@ class MIMICExtractor:
         piv.columns = ["hadm_id"] + [self._col(c, prefix) for c in piv.columns[1:]]
         self._merge(piv)
 
-    def _top_contributors(self, src, val_col, min_count=50, top_k=100):
+    def _top_contributors(self, src, val_col, min_count=EXTRACT_MIN_CONTRIB_COUNT, top_k=100):
         if src.empty or val_col not in src.columns:
             return []
         base = float(self.df["readmit_30"].mean())
@@ -300,20 +316,20 @@ class MIMICExtractor:
         vdf = pd.DataFrame(rows)
         # Clinical threshold flags
         if "v_sbp_mean" in vdf.columns:
-            vdf["hypotension"]=(vdf["v_sbp_mean"]<90).astype("int8")
-            vdf["hypertension"]=(vdf["v_sbp_mean"]>160).astype("int8")
+            vdf["hypotension"] =(vdf["v_sbp_mean"] < VITALS_HYPO_SBP).astype("int8")
+            vdf["hypertension"]=(vdf["v_sbp_mean"] > VITALS_HYPER_SBP).astype("int8")
         if "v_spo2_mean" in vdf.columns:
-            vdf["hypoxia"]=(vdf["v_spo2_mean"]<92).astype("int8")
+            vdf["hypoxia"]=(vdf["v_spo2_mean"] < VITALS_HYPOXIA_SPO2).astype("int8")
         if "v_hr_mean" in vdf.columns:
-            vdf["tachycardia"]=(vdf["v_hr_mean"]>100).astype("int8")
-            vdf["bradycardia"]=(vdf["v_hr_mean"]<60).astype("int8")
+            vdf["tachycardia"]=(vdf["v_hr_mean"] > VITALS_TACHY_HR).astype("int8")
+            vdf["bradycardia"] =(vdf["v_hr_mean"] < VITALS_BRADY_HR).astype("int8")
         if "v_rr_mean" in vdf.columns:
-            vdf["tachypnea"]=(vdf["v_rr_mean"]>20).astype("int8")
+            vdf["tachypnea"]=(vdf["v_rr_mean"] > VITALS_TACHYPNEA_RR).astype("int8")
         if "v_temp_f_mean" in vdf.columns:
-            vdf["fever"]=(vdf["v_temp_f_mean"]>100.4).astype("int8")
+            vdf["fever"]=(vdf["v_temp_f_mean"] > VITALS_FEVER_F).astype("int8")
         if "v_gcs_e_mean" in vdf.columns:
             vdf["gcs_total"]=vdf.get("v_gcs_e_mean",0)+vdf.get("v_gcs_v_mean",0)+vdf.get("v_gcs_m_mean",0)
-            vdf["gcs_low"]=(vdf["gcs_total"]<10).astype("int8")
+            vdf["gcs_low"]=(vdf["gcs_total"] < VITALS_GCS_LOW).astype("int8")
         self._merge(vdf)
         del agg_dict, rows, vdf; gc.collect()
 
@@ -368,16 +384,16 @@ class MIMICExtractor:
             rows.append(row)
         ldf = pd.DataFrame(rows)
         # Clinical thresholds
-        if "lab_creatinine_last" in ldf.columns: ldf["aki"]=(ldf["lab_creatinine_last"]>1.5).astype("int8")
-        if "lab_lactate_last"    in ldf.columns: ldf["hyperlactatemia"]=(ldf["lab_lactate_last"]>2.0).astype("int8")
-        if "lab_hemoglobin_last" in ldf.columns: ldf["anemia"]=(ldf["lab_hemoglobin_last"]<10.0).astype("int8")
+        if "lab_creatinine_last" in ldf.columns: ldf["aki"]=(ldf["lab_creatinine_last"] > LAB_AKI_CREATININE).astype("int8")
+        if "lab_lactate_last"    in ldf.columns: ldf["hyperlactatemia"]=(ldf["lab_lactate_last"] > LAB_HYPERLAC).astype("int8")
+        if "lab_hemoglobin_last" in ldf.columns: ldf["anemia"]=(ldf["lab_hemoglobin_last"] < LAB_ANEMIA_HGB).astype("int8")
         if "lab_wbc_last"        in ldf.columns:
-            ldf["leukocytosis"]=(ldf["lab_wbc_last"]>11.0).astype("int8")
-            ldf["leukopenia"]=(ldf["lab_wbc_last"]<4.0).astype("int8")
-        if "lab_platelets_last"  in ldf.columns: ldf["thrombocytopenia"]=(ldf["lab_platelets_last"]<100).astype("int8")
+            ldf["leukocytosis"]=(ldf["lab_wbc_last"] > LAB_LEUKO_HIGH).astype("int8")
+            ldf["leukopenia"]  =(ldf["lab_wbc_last"] < LAB_LEUKO_LOW).astype("int8")
+        if "lab_platelets_last"  in ldf.columns: ldf["thrombocytopenia"]=(ldf["lab_platelets_last"] < LAB_THROMBO_LOW).astype("int8")
         if "lab_sodium_last"     in ldf.columns:
-            ldf["hyponatremia"]=(ldf["lab_sodium_last"]<135).astype("int8")
-            ldf["hypernatremia"]=(ldf["lab_sodium_last"]>145).astype("int8")
+            ldf["hyponatremia"] =(ldf["lab_sodium_last"] < LAB_HYPONATR).astype("int8")
+            ldf["hypernatremia"]=(ldf["lab_sodium_last"] > LAB_HYPERNATR).astype("int8")
         self._merge(ldf)
         del per_item, abn_dict, cnt_dict, rows, ldf; gc.collect()
 
@@ -621,7 +637,7 @@ class MIMICExtractor:
         protected = {"subject_id","hadm_id",target}
         num_cols = [c for c in self.df.select_dtypes(include=[np.number]).columns if c not in protected]
         corr = self.df[num_cols].corrwith(self.df[target]).abs().fillna(0).sort_values(ascending=False)
-        keep = list(corr.head(500).index)
+        keep = list(corr.head(EXTRACT_FEATURE_KEEP_TOP).index)
         self.df = self.df[["subject_id","hadm_id",target]+keep]
         logger.info("Shape: %s | readmit=%.2f%%", self.df.shape, self.df[target].mean()*100)
         self.df.to_csv(FEATURES_CSV, index=False)

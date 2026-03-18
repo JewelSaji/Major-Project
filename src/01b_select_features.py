@@ -23,9 +23,17 @@ warnings.filterwarnings("ignore")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import DATA_DIR, FEATURES_CSV, MODELS_DIR
+    from .config import (
+        DATA_DIR, FEATURES_CSV, MODELS_DIR,
+        SELECT_TOP_N, SELECT_N_FOLDS, SELECT_CORR_THRESH, SELECT_VAR_THRESH,
+        SELECT_MI_SUBSAMPLE, SELECT_WEIGHT_SHAP, SELECT_WEIGHT_GAIN, SELECT_WEIGHT_MI,
+    )
 except ImportError:
-    from config import DATA_DIR, FEATURES_CSV, MODELS_DIR
+    from config import (
+        DATA_DIR, FEATURES_CSV, MODELS_DIR,
+        SELECT_TOP_N, SELECT_N_FOLDS, SELECT_CORR_THRESH, SELECT_VAR_THRESH,
+        SELECT_MI_SUBSAMPLE, SELECT_WEIGHT_SHAP, SELECT_WEIGHT_GAIN, SELECT_WEIGHT_MI,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +42,7 @@ SELECTED_FEATURES_JSON = os.path.join(MODELS_DIR, "selected_features.json")
 PRUNED_CSV = FEATURES_CSV.replace(".csv", "_pruned.csv")
 
 
-def select_features(top_n: int = 160) -> bool:
+def select_features(top_n: int = SELECT_TOP_N) -> bool:
     if not os.path.exists(FEATURES_CSV):
         logger.error("Features file not found: %s", FEATURES_CSV)
         return False
@@ -47,13 +55,13 @@ def select_features(top_n: int = 160) -> bool:
     y = df["readmit_30"].astype("int8")
 
     var = X.var()
-    X = X.loc[:, var > 1e-8]
+    X = X.loc[:, var > SELECT_VAR_THRESH]
     logger.info("Features after zero-variance removal: %d", X.shape[1])
 
-    X = _remove_correlated(X, threshold=0.97)
+    X = _remove_correlated(X, threshold=SELECT_CORR_THRESH)
     logger.info("Features after correlation pruning: %d", X.shape[1])
 
-    n_folds = 3
+    n_folds = SELECT_N_FOLDS
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     shap_importance = np.zeros(X.shape[1])
@@ -88,10 +96,12 @@ def select_features(top_n: int = 160) -> bool:
     gain_importance /= n_folds
 
     logger.info("Computing mutual information ...")
-    idx = np.random.RandomState(42).choice(len(X), min(50_000, len(X)), replace=False)
+    idx = np.random.RandomState(42).choice(len(X), min(SELECT_MI_SUBSAMPLE, len(X)), replace=False)
     try:
-        mi_importance = mutual_info_classif(X.iloc[idx].values, y.iloc[idx].values,
-                                            discrete_features=False, random_state=42)
+        mi_importance = mutual_info_classif(
+            X.iloc[np.random.RandomState(42).choice(len(X), min(SELECT_MI_SUBSAMPLE, len(X)), replace=False)].values,
+            y.iloc[np.random.RandomState(42).choice(len(X), min(SELECT_MI_SUBSAMPLE, len(X)), replace=False)].values,
+            discrete_features=False, random_state=42)
     except Exception as e:
         logger.warning("MI failed: %s", e)
         mi_importance = np.zeros(X.shape[1])
@@ -101,9 +111,9 @@ def select_features(top_n: int = 160) -> bool:
         return r / r.max()
 
     combined_score = (
-        rank_norm(shap_importance) * 0.5 +
-        rank_norm(gain_importance) * 0.3 +
-        rank_norm(mi_importance) * 0.2
+        rank_norm(shap_importance) * SELECT_WEIGHT_SHAP +
+        rank_norm(gain_importance) * SELECT_WEIGHT_GAIN +
+        rank_norm(mi_importance)   * SELECT_WEIGHT_MI
     )
 
     feat_df = pd.DataFrame({
@@ -129,7 +139,7 @@ def select_features(top_n: int = 160) -> bool:
     return True
 
 
-def _remove_correlated(X: pd.DataFrame, threshold: float = 0.97) -> pd.DataFrame:
+def _remove_correlated(X: pd.DataFrame, threshold: float = SELECT_CORR_THRESH) -> pd.DataFrame:
     corr = X.corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [c for c in upper.columns if any(upper[c] > threshold)]

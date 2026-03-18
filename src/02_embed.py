@@ -30,17 +30,31 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import normalize, StandardScaler
 
 warnings.filterwarnings("ignore")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
-    from .config import (DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
-                         FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE)
+    from .config import (
+        DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
+        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE,
+        CLINICAL_T5_LARGE_DIR, CLINICAL_T5_BASE_DIR, CLINICAL_T5_SCI_DIR,
+        EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
+        EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
+        EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+        EMBEDDING_REDUCTION, EMBED_FUSION_ENABLED, EMBED_FUSION_MODELS,
+    )
 except ImportError:
-    from config import (DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
-                        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE)
+    from config import (
+        DATA_DIR, EMBEDDINGS_CSV, EMBEDDING_INFO_PKL,
+        FEATURES_CSV, MIMIC_BHC_DIR, MIMIC_NOTE_DIR, RANDOM_STATE,
+        CLINICAL_T5_LARGE_DIR, CLINICAL_T5_BASE_DIR, CLINICAL_T5_SCI_DIR,
+        EMBED_DIM, EMBED_MAX_SEQ_LEN, EMBED_GPU_BATCH, EMBED_CPU_BATCH,
+        EMBED_MIN_TEXT_LEN, EMBED_MAX_CHARS, EMBED_CHUNK_WORDS,
+        EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
+        EMBEDDING_REDUCTION, EMBED_FUSION_ENABLED, EMBED_FUSION_MODELS,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,22 +66,29 @@ FINETUNED_ENCODER_DIR = os.path.join(
     "encoder",
 )
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-EMBEDDING_DIM   = 256          # final PCA dimension (higher text capacity)
-MAX_SEQ_LEN     = 512
-GPU_BATCH       = 4            # safe for 3050 8GB
-CPU_BATCH       = 8
-MIN_TEXT_LEN    = 50
-MAX_TEXT_CHARS  = 5000         # chars per admission
-CHUNK_WORDS     = 220
-CHUNK_OVERLAP   = 40
-MAX_CHUNKS_PER_NOTE = 6
+# ── CONFIG (all values sourced from config.py) ───────────────────────────────
+EMBEDDING_DIM       = EMBED_DIM
+MAX_SEQ_LEN         = EMBED_MAX_SEQ_LEN
+GPU_BATCH           = EMBED_GPU_BATCH
+CPU_BATCH           = EMBED_CPU_BATCH
+MIN_TEXT_LEN        = EMBED_MIN_TEXT_LEN
+MAX_TEXT_CHARS      = EMBED_MAX_CHARS
+CHUNK_WORDS         = EMBED_CHUNK_WORDS
+CHUNK_OVERLAP       = EMBED_CHUNK_OVERLAP
+MAX_CHUNKS_PER_NOTE = EMBED_MAX_CHUNKS
+NOTES_CACHE_PATH    = os.path.join(DATA_DIR, "embed_cache", "notes_preprocessed.csv.gz")
 
 def _model_candidates() -> List[tuple]:
-    # Prioritize local fine-tuned encoder if available.
+    # Prioritize finetuned encoder first, then local Clinical-T5 models (Large > Base > Sci).
     cand: List[tuple] = []
     if os.path.exists(os.path.join(FINETUNED_ENCODER_DIR, "config.json")):
         cand.append((FINETUNED_ENCODER_DIR, "t5", False))
+    if os.path.exists(os.path.join(CLINICAL_T5_LARGE_DIR, "config.json")):
+        cand.append((CLINICAL_T5_LARGE_DIR, "t5", False))
+    if os.path.exists(os.path.join(CLINICAL_T5_BASE_DIR, "config.json")):
+        cand.append((CLINICAL_T5_BASE_DIR, "t5", False))
+    if os.path.exists(os.path.join(CLINICAL_T5_SCI_DIR, "config.json")):
+        cand.append((CLINICAL_T5_SCI_DIR, "t5", False))
     cand.extend([
         ("luqh/ClinicalT5-base", "t5", True),    # HF Flax weights
         ("emilyalsentzer/Bio_ClinicalBERT", "bert", False),
@@ -76,12 +97,41 @@ def _model_candidates() -> List[tuple]:
     ])
     return cand
 
+
+def _infer_model_type(model_name: str) -> str:
+    name = (model_name or "").lower()
+    if "t5" in name or "clinical_t5" in name or "clinical-t5" in name:
+        return "t5"
+    return "bert"
+
+
+def _resolve_fusion_models() -> List[str]:
+    models = []
+    for m in EMBED_FUSION_MODELS:
+        if m == "finetuned_t5":
+            models.append(FINETUNED_ENCODER_DIR)
+        else:
+            models.append(m)
+    return models
+
+
+def _safe_model_tag(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", name.strip("/"))
+
 HIGH_VALUE_SECTIONS = [
     "brief hospital course", "hospital course", "discharge diagnosis",
     "discharge condition", "assessment and plan", "assessment/plan",
     "pertinent results", "discharge medications", "history of present illness",
     "past medical history", "social history", "discharge disposition",
     "major surgical", "reason for hospitalization",
+    "physical exam", "impression", "consultations", "treatment",
+    "complications", "medications",
+]
+
+BOILERPLATE_PATTERNS = [
+    r"dictated by.*",
+    r"electronically signed.*",
+    r"page\s+\d+\s+of\s+\d+",
 ]
 
 
@@ -93,6 +143,9 @@ def preprocess_note(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
     # Remove MIMIC de-id placeholders
     text = re.sub(r"\[\*\*.*?\*\*\]", " ", text)
     text = text.replace("\r", "\n")
+    # Remove boilerplate lines
+    for pat in BOILERPLATE_PATTERNS:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
 
     # Try extracting high-value sections
     extracted = []
@@ -128,6 +181,18 @@ def build_file_index(dirs: List[str]) -> Dict[str, str]:
 
 
 def load_notes(cohort_hadm: set, file_index: Dict[str, str]) -> pd.DataFrame:
+    # Fast path: reuse cached preprocessed notes if available
+    if os.path.exists(NOTES_CACHE_PATH):
+        logger.info("Loading cached notes → %s", NOTES_CACHE_PATH)
+        try:
+            cached = pd.read_csv(NOTES_CACHE_PATH, usecols=["hadm_id", "text"])
+            cached = cached[cached["hadm_id"].isin(cohort_hadm)].dropna(subset=["text"])
+            cached = cached[cached["text"].str.len() >= MIN_TEXT_LEN].drop_duplicates("hadm_id")
+            logger.info("  Cached notes matched: %d", len(cached))
+            return cached
+        except Exception as e:
+            logger.warning("Failed to read notes cache, rebuilding. %s", str(e)[:120])
+
     frames = []
 
     # Discharge notes (primary)
@@ -175,6 +240,15 @@ def load_notes(cohort_hadm: set, file_index: Dict[str, str]) -> pd.DataFrame:
             notes = notes.drop(columns=["text_y"])
     notes["text"] = notes["text"].str.strip()
     notes = notes[notes["text"].str.len() >= MIN_TEXT_LEN].drop_duplicates("hadm_id")
+
+    # Save cache for faster restarts
+    try:
+        os.makedirs(os.path.dirname(NOTES_CACHE_PATH), exist_ok=True)
+        notes.to_csv(NOTES_CACHE_PATH, index=False, compression="gzip")
+        logger.info("Saved preprocessed notes cache → %s", NOTES_CACHE_PATH)
+    except Exception as e:
+        logger.warning("Failed to save notes cache: %s", str(e)[:120])
+
     return notes
 
 
@@ -193,12 +267,18 @@ def load_encoder(device: torch.device):
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             dtype = torch.float16 if device.type == "cuda" else torch.float32
 
-            if mtype == "t5" and try_flax:
-                # ClinicalT5 is Flax-only on HuggingFace
-                model = T5EncoderModel.from_pretrained(
-                    model_name, from_flax=True,
-                    dtype=dtype, low_cpu_mem_usage=True
-                ).to(device).eval()
+            if mtype == "t5":
+                if try_flax:
+                    # ClinicalT5 is Flax-only on HuggingFace
+                    model = T5EncoderModel.from_pretrained(
+                        model_name, from_flax=True,
+                        dtype=dtype, low_cpu_mem_usage=True
+                    ).to(device).eval()
+                else:
+                    model = T5EncoderModel.from_pretrained(
+                        model_name,
+                        dtype=dtype, low_cpu_mem_usage=True
+                    ).to(device).eval()
             else:
                 model = AutoModel.from_pretrained(
                     model_name, dtype=dtype, low_cpu_mem_usage=True
@@ -213,6 +293,58 @@ def load_encoder(device: torch.device):
 
     raise RuntimeError("All models failed to load.")
 
+
+def load_specific_encoder(device: torch.device, model_name: str, mtype: str = None):
+    """
+    Load a specific encoder (T5 or BERT) for multi-model fusion.
+    """
+    from transformers import (AutoModel, AutoTokenizer, T5EncoderModel)
+
+    resolved_type = mtype or _infer_model_type(model_name)
+    logger.info("Trying %s ...", model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    if resolved_type == "t5":
+        try:
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            ).to(device).eval()
+        except Exception:
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                from_flax=True,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            ).to(device).eval()
+    else:
+        model = AutoModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            low_cpu_mem_usage=True
+        ).to(device).eval()
+
+    logger.info("Loaded %s on %s", model_name, device)
+    return model, tokenizer, resolved_type, model_name
+
+
+from torch.utils.data import Dataset, DataLoader
+
+class NoteDataset(Dataset):
+    def __init__(self, texts: List[str]):
+        self.texts = texts
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        chunks = _note_chunks(text)
+        if not chunks:
+            chunks = ["[NO_NOTE]"]
+        return chunks
 
 # ── ENCODING ─────────────────────────────────────────────────────────────────
 
@@ -230,10 +362,13 @@ def encode_batch(model, tokenizer, texts: List[str], device: torch.device,
         out = model(input_ids=input_ids, attention_mask=attention_mask)
 
     hidden = out.last_hidden_state                          # (B, L, H)
-    mask   = attention_mask.unsqueeze(-1).float()
-    pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+    # Attention-weighted pooling (compute scores in fp32 to avoid fp16 overflow)
+    scores = hidden.float().mean(dim=-1)
+    scores = scores.masked_fill(attention_mask == 0, -1e9)
+    weights = torch.softmax(scores, dim=1).unsqueeze(-1).type_as(hidden)
+    pooled = (hidden * weights).sum(1)
     result = pooled.cpu().float().numpy()
-    del input_ids, attention_mask, out, hidden, mask, pooled
+    del input_ids, attention_mask, out, hidden, pooled, weights, scores
     return result
 
 
@@ -255,47 +390,70 @@ def _note_chunks(text: str) -> List[str]:
 
 
 def encode_all(model, tokenizer, texts: List[str], device: torch.device,
-               mtype: str, batch_size: int) -> np.ndarray:
+               mtype: str, batch_size: int, cache_dir: str) -> np.ndarray:
     """
-    Encode each admission note using chunked pooling:
-      - split long note into chunks
-      - encode chunks
-      - average chunk embeddings
-    Missing notes get a dedicated token string to preserve a learnable signature.
+    Encode each admission note using DataLoader for efficient processing
+    and chunked pooling. Saves intermediate results to a cache directory 
+    to allow resuming.
     """
+    os.makedirs(cache_dir, exist_ok=True)
     all_emb = []
     n = len(texts)
+    
+    chunk_size = 10000  # Increased to 10k for faster checkpointing with DataLoader
+    for chunk_start in range(0, n, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n)
+        cache_file = os.path.join(cache_dir, f"emb_chunk_{chunk_start}_{chunk_end}.npy")
+        
+        if os.path.exists(cache_file):
+            logger.info("  Loaded cached chunks [%d:%d]", chunk_start, chunk_end)
+            all_emb.append(np.load(cache_file))
+            continue
+            
+        logger.info("  Processing chunks [%d:%d]", chunk_start, chunk_end)
+        chunk_texts = texts[chunk_start:chunk_end]
+        
+        # DataLoader handles parallel extraction of chunks, though tokenization
+        # still happens mostly sequentially over the batch in this simple setup.
+        # It still reduces Python loop overhead.
+        dataset = NoteDataset(chunk_texts)
+        # Using a custom collate_fn so we just get a list of chunk lists
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, 
+                                collate_fn=lambda x: x[0])
+        
+        chunk_emb_list = []
 
-    for i, text in enumerate(texts):
-        chunks = _note_chunks(text)
-        if not chunks:
-            chunks = ["[NO_NOTE]"]
+        for i, chunks in enumerate(dataloader):
+            try:
+                emb_parts = []
+                # To maximize GPU utilization, we pass as many chunks as possible
+                # up to batch_size directly to tokenizer
+                for j in range(0, len(chunks), batch_size):
+                    part = chunks[j:j + batch_size]
+                    emb_parts.append(encode_batch(model, tokenizer, part, device, mtype))
+                emb_note = np.vstack(emb_parts).mean(axis=0, keepdims=True)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.warning("OOM at note %d; trying chunk-by-chunk", chunk_start + i)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    emb_note = np.vstack(
+                        [encode_batch(model, tokenizer, [c], device, mtype) for c in chunks]
+                    ).mean(axis=0, keepdims=True)
+                else:
+                    raise
 
-        try:
-            emb_parts = []
-            for j in range(0, len(chunks), batch_size):
-                part = chunks[j:j + batch_size]
-                emb_parts.append(encode_batch(model, tokenizer, part, device, mtype))
-            emb_note = np.vstack(emb_parts).mean(axis=0, keepdims=True)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                logger.warning("OOM at note %d; trying chunk-by-chunk", i)
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
-                emb_note = np.vstack(
-                    [encode_batch(model, tokenizer, [c], device, mtype) for c in chunks]
-                ).mean(axis=0, keepdims=True)
-            else:
-                raise
+            chunk_emb_list.append(emb_note.astype(np.float32))
 
-        all_emb.append(emb_note.astype(np.float32))
-
-        if device.type == "cuda" and i % 100 == 0:
+        chunk_emb = np.vstack(chunk_emb_list).astype(np.float32)
+        np.save(cache_file, chunk_emb)
+        all_emb.append(chunk_emb)
+        
+        if device.type == "cuda":
             torch.cuda.empty_cache()
-        if i % 500 == 0:
-            gc.collect()
-            logger.info("  Encoded %d/%d (%.1f%%)", i + 1, n, (i + 1) / n * 100)
+        gc.collect()
+        logger.info("  Saved chunk [%d:%d] (%.1f%% overall)", chunk_start, chunk_end, chunk_end / n * 100)
 
     return np.vstack(all_emb).astype(np.float32)
 
@@ -334,11 +492,49 @@ class EmbeddingPipeline:
 
         # ── Try transformer encoding ──────────────────────────────────────
         try:
-            model, tokenizer, mtype, model_name_used = load_encoder(device)
             batch_size = GPU_BATCH if device.type == "cuda" else CPU_BATCH
-            logger.info("Encoding %d texts with %s (batch=%d) ...", len(texts), model_name_used, batch_size)
+            models_meta = []
 
-            raw = encode_all(model, tokenizer, texts, device, mtype, batch_size)
+            if EMBED_FUSION_ENABLED:
+                raw_list = []
+                for model_name in _resolve_fusion_models():
+                    model, tokenizer, mtype, model_name_used = load_specific_encoder(
+                        device, model_name
+                    )
+                    logger.info(
+                        "Encoding %d texts with %s (batch=%d) ...",
+                        len(texts), model_name_used, batch_size,
+                    )
+                    cache_dir = os.path.join(
+                        DATA_DIR, "embed_cache", f"fusion_{_safe_model_tag(model_name_used)}"
+                    )
+                    raw_i = encode_all(model, tokenizer, texts, device, mtype, batch_size,
+                                       cache_dir=cache_dir)
+                    raw_list.append(raw_i)
+                    models_meta.append({"name": model_name_used, "type": mtype})
+                    del model
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                raw = np.concatenate(raw_list, axis=1)
+                method = "multi_fusion"
+            else:
+                model, tokenizer, mtype, model_name_used = load_encoder(device)
+                logger.info(
+                    "Encoding %d texts with %s (batch=%d) ...",
+                    len(texts), model_name_used, batch_size,
+                )
+                raw = encode_all(model, tokenizer, texts, device, mtype, batch_size,
+                                 cache_dir=os.path.join(DATA_DIR, "embed_cache"))
+                models_meta = [{"name": model_name_used, "type": mtype}]
+                method = f"transformer_{mtype}"
+
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
+
             logger.info("Raw embeddings: %s", raw.shape)
 
             zero_ratio = (raw == 0).mean()
@@ -348,25 +544,33 @@ class EmbeddingPipeline:
             if zero_ratio > 0.9 or var_mean < 1e-7:
                 raise ValueError(f"Poor embedding quality: zero={zero_ratio:.3f}")
 
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-
-            # PCA
-            scaler  = StandardScaler()
-            raw_std = scaler.fit_transform(raw)
+            # L2 normalize before reduction
+            raw_norm = normalize(raw, norm="l2")
             del raw; gc.collect()
 
-            n_comp = min(EMBEDDING_DIM, raw_std.shape[1], raw_std.shape[0]-1)
-            pca    = PCA(n_components=n_comp, random_state=RANDOM_STATE, svd_solver="randomized")
-            embeddings = pca.fit_transform(raw_std).astype(np.float32)
-            logger.info("PCA explained variance: %.1f%%", pca.explained_variance_ratio_.sum()*100)
-            del raw_std; gc.collect()
+            if EMBEDDING_REDUCTION == "pca":
+                n_comp = min(EMBEDDING_DIM, raw_norm.shape[1], raw_norm.shape[0]-1)
+                pca = PCA(n_components=n_comp, random_state=RANDOM_STATE, svd_solver="randomized")
+                embeddings = pca.fit_transform(raw_norm).astype(np.float32)
+                logger.info("PCA explained variance: %.1f%%", pca.explained_variance_ratio_.sum()*100)
+                reducer = pca
+            elif EMBEDDING_REDUCTION == "umap":
+                try:
+                    import umap
+                except Exception as e:
+                    raise RuntimeError("UMAP requested but umap-learn not installed") from e
+                reducer = umap.UMAP(n_components=EMBEDDING_DIM, random_state=RANDOM_STATE)
+                embeddings = reducer.fit_transform(raw_norm).astype(np.float32)
+            else:
+                raise ValueError(f"Unknown EMBEDDING_REDUCTION: {EMBEDDING_REDUCTION}")
 
-            method     = f"transformer_{mtype}"
-            model_info = {"method": method, "model": model_name_used,
-                          "scaler": scaler, "pca": pca, "dim": n_comp}
+            model_info = {
+                "method": method,
+                "models": models_meta,
+                "reduction": EMBEDDING_REDUCTION,
+                "reducer": reducer,
+                "dim": embeddings.shape[1],
+            }
 
         except Exception as e:
             logger.error("Transformer encoding failed: %s", e)
@@ -388,9 +592,10 @@ class EmbeddingPipeline:
             feat_hadm  = ff["hadm_id"].tolist()
             model_info = {"method": "feature_svd", "scaler": scaler, "pca": svd, "dim": n_comp}
             del ff, X, Xs; gc.collect()
-            model_name_used = "feature_svd"
+        method_name = model_info.get("method", "feature_svd")
 
         # ── Save ──────────────────────────────────────────────────────────
+        method_name = model_info.get("method", "unknown")
         n_dims = embeddings.shape[1]
         emb_df = pd.DataFrame(embeddings, columns=[f"ct5_{i}" for i in range(n_dims)])
         # Explicit text-quality signals improve fusion robustness.
@@ -400,7 +605,7 @@ class EmbeddingPipeline:
         emb_df["hadm_id"] = feat_hadm
         emb_df.to_csv(EMBEDDINGS_CSV, index=False)
         joblib.dump(model_info, EMBEDDING_INFO_PKL)
-        logger.info("Saved embeddings → %s (%d dims, method=%s)", EMBEDDINGS_CSV, n_dims, model_name_used)
+        logger.info("Saved embeddings → %s (%d dims, method=%s)", EMBEDDINGS_CSV, n_dims, method_name)
 
 
 if __name__ == "__main__":
