@@ -184,7 +184,7 @@ EMBED_MAX_CHUNKS    = 6     # max chunks per note (limits compute)
 # 8. TRAINING SETTINGS  (03_train.py)
 # ========================================
 # Optuna hyperparameter search — more trials → better HPO, slower run.
-TRAIN_OPTUNA_TRIALS      = 75
+TRAIN_OPTUNA_TRIALS      = 5
 
 # DART tree cap (DART has no early stopping, so keep bounded).
 TRAIN_DART_MAX_TREES     = 800
@@ -213,6 +213,9 @@ TRAIN_FEATURE_SUBSETS    = [128, 160, 220, 259]
 
 # Enable stacked ensemble (LightGBM + XGBoost [+ CatBoost if installed])
 TRAIN_ENABLE_STACK       = True
+
+# Auto feature subset search toggle
+TRAIN_ENABLE_AUTO_FEATURE_SUBSET = False
 
 # Logistic meta-learner C regularisation search space.
 TRAIN_META_C_CANDIDATES  = [0.3, 1.0, 3.0, 10.0]
