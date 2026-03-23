@@ -250,3 +250,38 @@ TRAIN_HPO_ALPHA_AUPRC    = 0.35
 # ========================================
 # Rows sampled for SHAP TreeExplainer — larger = more accurate but slower.
 SHAP_N_SAMPLES = 500
+
+# ========================================
+# 10. GATED FUSION SETTINGS
+# ========================================
+
+# Path for the new gated model
+GATE_MODEL_PKL = os.path.join(MODELS_DIR, "trance_gate.pkl")
+
+# Gate network architecture
+GATE_HIDDEN_DIM = 128        # hidden layer size inside gate network
+GATE_TEXT_DIM = 512          # must match EMBED_DIM from section 7
+GATE_DROPOUT = 0.3           # dropout in MLP classifier head
+GATE_LR = 1e-4               # learning rate for Adam optimizer
+GATE_EPOCHS = 100            # max epochs, early stopping will cut this short
+GATE_PATIENCE = 10           # early stopping patience on val AUROC
+GATE_SEEDS = [42, 2024, 777] # seeds for multi-seed ensemble
+
+# ========================================
+# 11. ANALYSIS OUTPUT PATHS
+# ========================================
+
+FAIRNESS_RESULTS_CSV    = os.path.join(RESULTS_DIR, "fairness_analysis.csv")
+CALIBRATION_RESULTS_CSV = os.path.join(RESULTS_DIR, "calibration_analysis.csv")
+GATE_WEIGHTS_NPY        = os.path.join(RESULTS_DIR, "gate_weights.npy")
+GATE_PATIENT_IDS_NPY    = os.path.join(RESULTS_DIR, "gate_patient_ids.npy")
+EARLY_WARNING_CSV       = os.path.join(RESULTS_DIR, "early_warning_results.csv")
+TEMPORAL_DRIFT_CSV      = os.path.join(RESULTS_DIR, "temporal_drift_results.csv")
+
+# ========================================
+# 12. EARLY WARNING SETTINGS
+# ========================================
+
+# Day cutoffs to evaluate for early warning experiment
+EARLY_WARNING_DAYS = [1, 2, 3, 5, 7]
+# "full" is added automatically in the early warning script

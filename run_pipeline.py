@@ -66,19 +66,20 @@ def main():
     # ------------------------------------------------------------------ #
 
     steps = [
-        # Stage 1 – Data preparation
-        ("1/9  Feature Extraction",           "01_extract.py"),
-        ("2/9  Feature Selection (SHAP)",     "01b_select_features.py"),
-        # Stage 2 – Embeddings  (02a is opt-in via env var)
-        ("4/9  Clinical T5 Embedding",        "02_embed.py"),
-        # Stage 3 – Model training
-        ("5/9  Model Training & Calibration", "03_train.py"),
-        # Stage 4 – Diagnostics & analysis
-        ("6/9  Embedding Diagnostics",        "04_diagnose.py"),
-        ("7/9  SHAP Interpretability",        "05_analyze.py"),
-        # Stage 5 – Output generation
-        ("8/9  Journal Visualizations",       "06_visualize.py"),
-        ("9/9  Cross-Paper Model Comparison", "09_compare_models.py"),
+        ("1/9  Feature Extraction",              "01_extract"),
+        ("2/9  Feature Selection (SHAP)",        "01b_select_features"),
+        ("3/9  Clinical T5 Embedding",           "02_embed"),
+        ("4/9  Model Training (LightGBM)",       "03_train"),
+        ("5/9  Embedding Diagnostics",           "04_diagnose"),
+        ("6/9  SHAP Interpretability",           "05_analyze"),
+        ("7/9  Journal Visualizations",          "06_visualize"),
+        ("8/9  Cross-Paper Comparison",          "09_compare_models"),
+        # New additions below
+        ("9/13 TRANCE-Gate Training",            "gated_fusion_model"),
+        ("10/13 Gate Interpretability Analysis", "10_gate_interpretability"),
+        ("11/13 Fairness and Calibration",       "11_fairness_calibration"),
+        ("12/13 Early Warning Analysis",         "12_early_warning"),
+        ("13/13 Temporal Drift Analysis",        "13_temporal_drift"),
     ]
 
     # Optionally inject ClinicalT5 fine-tuning before embedding step
