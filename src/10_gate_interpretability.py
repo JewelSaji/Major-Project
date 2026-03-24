@@ -93,6 +93,24 @@ def load_discharge_notes(hadm_ids: set) -> dict:
     Returns dict mapping hadm_id -> lowercased note text.  
     """  
     note_text = {}  
+    # ── Try preprocessed cache from 02_embed.py first ───────────────────────
+    try:
+        from config import DATA_DIR
+        cache_path = os.path.join(DATA_DIR, "embed_cache", "notes_preprocessed.csv.gz")
+        if os.path.exists(cache_path):
+            logger.info("Loading preprocessed notes from cache: %s", cache_path)
+            # Use chunksize for efficiency if needed, but 2M rows is manageable
+            df = pd.read_csv(cache_path, usecols=["hadm_id", "text"], low_memory=True)
+            df = df[df["hadm_id"].isin(hadm_ids)].dropna(subset=["text"])
+            for row in df.itertuples():
+                note_text[int(row.hadm_id)] = str(row.text).lower()
+            logger.info("  Loaded %d notes from cache", len(note_text))
+            if len(note_text) > 0:
+                return note_text
+    except Exception as e:
+        logger.warning("  Cache load failed: %s", e)
+
+    # ── Fallback to raw files (if they exist) ──────────────────────────────
     for base in [MIMIC_NOTE_DIR, MIMIC_BHC_DIR]:  
         if not os.path.isdir(base):  
             continue  

@@ -59,45 +59,30 @@ def run_temporal_drift():
 
     pruned = FEATURES_CSV.replace(".csv", "_pruned.csv")  
     feat_path = pruned if os.path.exists(pruned) else FEATURES_CSV  
-    df = pd.read_csv(feat_path, low_memory=False).fillna(0)
+    # Load only necessary columns to save memory
+    cols_to_load = ["hadm_id", "readmit_30", "anchor_year_group"]
+    df_full = pd.read_csv(feat_path, usecols=lambda x: x in cols_to_load or x == "hadm_id", low_memory=False).fillna(0)
+    df_full = df_full.drop_duplicates("hadm_id")
 
-    if "anchor_year_group" not in df.columns:  
+    if "anchor_year_group" not in df_full.columns:  
         logger.error("anchor_year_group not found in features. Run 01_extract.py first.")  
         return
 
-    groups    = df["subject_id"].values  
-    test_mask = get_test_mask(groups)  
-    df_test   = df[test_mask].reset_index(drop=True)  
-    y_test    = df_test["readmit_30"].values
-
     rows = []
 
-    # ── LightGBM predictions ────────────────────────────────────────────────  
-    if os.path.exists(MAIN_MODEL_PKL):  
-        bundle     = joblib.load(MAIN_MODEL_PKL)  
-        lgbm_probs = bundle.get("test_probs_cal")  
-        if lgbm_probs is not None and len(lgbm_probs) == len(y_test):  
-            for yg_code, yg_label in YEAR_GROUP_LABELS.items():  
-                mask = df_test["anchor_year_group"].values == yg_code  
-                if mask.sum() < 50:  
-                    continue  
-                auroc = roc_auc_score(y_test[mask], lgbm_probs[mask])  
-                rows.append({  
-                    "model": "LightGBM-ensemble",  
-                    "year_group": yg_label,  
-                    "year_group_code": yg_code,  
-                    "n_admissions": int(mask.sum()),  
-                    "readmit_rate": round(float(y_test[mask].mean()), 4),  
-                    "auroc": round(float(auroc), 4),  
-                })  
-                logger.info("LightGBM | %s | AUROC: %.4f (n=%d)",  
-                            yg_label, auroc, mask.sum())
-
-    # ── TRANCE-Gate predictions ─────────────────────────────────────────────  
+    # ── TRANCE-Gate ─────────────────────────────────────────────────────────  
     if os.path.exists(GATE_MODEL_PKL):  
+        logger.info("Processing TRANCE-Gate temporal drift...")
         bundle     = joblib.load(GATE_MODEL_PKL)  
         gate_probs = bundle.get("test_probs_cal")  
-        if gate_probs is not None and len(gate_probs) == len(y_test):  
+        gate_hadms = bundle.get("test_hadm_ids")
+        gate_labels = bundle.get("test_labels")
+
+        if gate_probs is not None and gate_hadms is not None:
+            df_test = pd.DataFrame({"hadm_id": gate_hadms})
+            df_test = df_test.merge(df_full, on="hadm_id", how="left").fillna(0)
+            y_test = gate_labels if gate_labels is not None else df_test["readmit_30"].values
+            
             for yg_code, yg_label in YEAR_GROUP_LABELS.items():  
                 mask = df_test["anchor_year_group"].values == yg_code  
                 if mask.sum() < 50:  
@@ -113,9 +98,44 @@ def run_temporal_drift():
                 })  
                 logger.info("TRANCE-Gate | %s | AUROC: %.4f (n=%d)",  
                             yg_label, auroc, mask.sum())
+        else:
+            logger.warning("TRANCE-Gate missing probs or HADMs.")
+
+    # ── LightGBM baseline ───────────────────────────────────────────────────  
+    if os.path.exists(MAIN_MODEL_PKL):  
+        logger.info("Processing LightGBM baseline temporal drift...")
+        try:
+            bundle     = joblib.load(MAIN_MODEL_PKL)  
+            lgbm_probs = bundle.get("test_probs_cal")  
+            lgbm_hadms = bundle.get("test_hadm_ids")
+            
+            if lgbm_probs is not None and lgbm_hadms is not None:
+                df_test_lgbm = pd.DataFrame({"hadm_id": lgbm_hadms})
+                df_test_lgbm = df_test_lgbm.merge(df_full, on="hadm_id", how="left").fillna(0)
+                y_test_lgbm = df_test_lgbm["readmit_30"].values
+                
+                for yg_code, yg_label in YEAR_GROUP_LABELS.items():  
+                    mask = df_test_lgbm["anchor_year_group"].values == yg_code  
+                    if mask.sum() < 50:  
+                        continue  
+                    auroc = roc_auc_score(y_test_lgbm[mask], lgbm_probs[mask])  
+                    rows.append({  
+                        "model": "LightGBM-ensemble",  
+                        "year_group": yg_label,  
+                        "year_group_code": yg_code,  
+                        "n_admissions": int(mask.sum()),  
+                        "readmit_rate": round(float(y_test_lgbm[mask].mean()), 4),  
+                        "auroc": round(float(auroc), 4),  
+                    })  
+                    logger.info("LightGBM | %s | AUROC: %.4f (n=%d)",  
+                                yg_label, auroc, mask.sum())
+            else:
+                logger.warning("LightGBM baseline missing test_probs_cal. Skipping.")
+        except Exception as e:
+            logger.warning("Failed to process baseline: %s", e)
 
     if not rows:  
-        logger.error("No results generated. Ensure models are trained.")  
+        logger.error("No results generated.")  
         return
 
     df_results = pd.DataFrame(rows)  

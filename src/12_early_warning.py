@@ -184,6 +184,9 @@ def run_early_warning():
         bundle = joblib.load(MAIN_MODEL_PKL)  
         stored = bundle.get("best_params", {})  
         if stored:  
+            # Avoid conflict: is_unbalance vs scale_pos_weight
+            if "is_unbalance" in stored and "scale_pos_weight" in best_params:
+                best_params.pop("scale_pos_weight")
             best_params.update({k: v for k, v in stored.items()  
                                 if k not in ("objective", "metric", "verbosity", "n_jobs")})
 
