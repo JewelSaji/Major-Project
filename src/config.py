@@ -196,7 +196,7 @@ EMBED_FUSION_MODELS = [
 # 8. TRAINING SETTINGS  (03_train.py)
 # ========================================
 # Optuna hyperparameter search — more trials → better HPO, slower run.
-TRAIN_OPTUNA_TRIALS      = 80
+TRAIN_OPTUNA_TRIALS      = 100
 
 # DART tree cap (DART has no early stopping, so keep bounded).
 TRAIN_DART_MAX_TREES     = 800
@@ -217,7 +217,7 @@ TRAIN_BLEND_TRIALS       = 500
 
 # How many of the highest-variance ct5_* embedding dimensions to keep.
 # Reduces embedding noise; set to EMBED_DIM to keep all.
-TRAIN_CT5_KEEP_DIMS      = 512
+TRAIN_CT5_KEEP_DIMS      = 256
 
 # Candidate feature-count subsets evaluated during auto feature selection.
 # The one giving highest val AUROC is chosen.
