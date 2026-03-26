@@ -29,7 +29,9 @@ FEATURES_CSV = os.path.join(DATA_DIR, "ultimate_features.csv")
 EMBEDDINGS_CSV = os.path.join(DATA_DIR, "embeddings.csv")
 
 # Model Files
-MAIN_MODEL_PKL = os.path.join(MODELS_DIR, "trance_framework.pkl")
+ACAGN_MAIN_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_framework.pkl")
+MAIN_MODEL_PKL = ACAGN_MAIN_MODEL_PKL
+MAIN_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "trance_framework.pkl")
 # EMBEDDING_INFO_PKL = os.path.join(MODELS_DIR, "clinical_t5_info.pkl")
 EMBEDDING_INFO_PKL = os.path.join(MODELS_DIR, "embedding_info.pkl")
 FEATURE_METADATA_JSON = os.path.join(MODELS_DIR, "feature_metadata.json")
@@ -256,10 +258,14 @@ SHAP_N_SAMPLES = 500
 # ========================================
 
 # Path for the new gated model
-GATE_MODEL_PKL = os.path.join(MODELS_DIR, "trance_gate.pkl")
+ACAGN_GATE_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_gate.pkl")
+GATE_MODEL_PKL = ACAGN_GATE_MODEL_PKL
+GATE_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "trance_gate.pkl")
 
 # Concat-MLP baseline (no gating; concatenate text + tabular directly)
-CONCAT_MLP_MODEL_PKL = os.path.join(MODELS_DIR, "concat_mlp.pkl")
+ACAGN_CONCAT_MLP_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_concat_mlp.pkl")
+CONCAT_MLP_MODEL_PKL = ACAGN_CONCAT_MLP_MODEL_PKL
+CONCAT_MLP_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "concat_mlp.pkl")
 
 # Gate network architecture
 GATE_HIDDEN_DIM = 128        # hidden layer size inside gate network

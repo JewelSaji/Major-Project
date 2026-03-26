@@ -10,7 +10,8 @@ This is the **detailed** and **fully traceable** final-results report for our pr
 
 Naming note:
 - The paper/system name is **ACAGN** (*An Adaptive Context-Aware Gating Network*).
-- Some saved artifacts and code identifiers still use the legacy `trance_*` prefix (for example `models/trance_framework.pkl`, `models/trance_gate.pkl`). Those correspond to the **ACAGN** Base Ensemble and ACAGN-Gate implementations.
+- Model artifacts are now standardized to the `acagn_*` naming scheme (e.g., `models/acagn_framework.pkl`, `models/acagn_gate.pkl`).
+- Legacy `trance_*` artifacts are still supported as a fallback for backwards compatibility.
 
 All metrics and tables below are taken from artifacts under `results/`:
 - `2026-03-24T04:46:17` (Base framework + Gate + Hybrid final run), plus follow-on analyses generated the same day.
@@ -101,9 +102,9 @@ This repo is organized as a script pipeline under `src/`:
 | 1 | `src/01_extract.py` | Extract structured EHR features | `data/ultimate_features.csv` |
 | 2 | `src/01b_select_features.py` | Feature ranking + pruning utilities | selection artifacts |
 | 3 | `src/02_embed.py` | Generate note embeddings (`ct5_*`) | `data/embeddings.csv` |
-| 4 | `src/03_train.py` | Train + calibrate stacked tree ensemble | `models/trance_framework.pkl`, `results/training_report.json` |
-| 5 | `src/gated_fusion_model.py` | Train + calibrate ACAGN-Gate | `models/trance_gate.pkl`, `results/gate_training_report.json` |
-| 5b | `src/concat_mlp_baseline.py` | Train + calibrate Concat-MLP baseline (no gating) | `models/concat_mlp.pkl`, `results/concat_mlp_training_report.json` |
+| 4 | `src/03_train.py` | Train + calibrate stacked tree ensemble | `models/acagn_framework.pkl`, `results/training_report.json` |
+| 5 | `src/gated_fusion_model.py` | Train + calibrate ACAGN-Gate | `models/acagn_gate.pkl`, `results/gate_training_report.json` |
+| 5b | `src/concat_mlp_baseline.py` | Train + calibrate Concat-MLP baseline (no gating) | `models/acagn_concat_mlp.pkl`, `results/concat_mlp_training_report.json` |
 | 6 | `src/10_gate_interpretability.py` | Gate interpretability testing | `results/gate_interpretability.csv`, `figures/gate_heatmap.png` |
 | 7 | `src/11_fairness_calibration.py` | Fairness + calibration across subgroups | `results/fairness_analysis.csv` |
 | 8 | `src/12_early_warning.py` | Early warning (Day-limited EHR) | `results/early_warning_results.csv`, `figures/early_warning_curve.png` |
@@ -148,7 +149,7 @@ The Base Ensemble uses automatic feature subset selection:
 - Candidate subsets evaluated on validation AUROC: top-128, 160, 220, 259, and full 675
 - Selected: **k = 128** (best validation AUROC)
 
-From the saved model bundle (`models/trance_framework.pkl`):
+From the saved model bundle (`models/acagn_framework.pkl`):
 - Final features used: `128`
 - Among them, **58** are `ct5_*` dimensions and **70** are structured features.
 
@@ -160,7 +161,7 @@ ACAGN-Gate is trained on:
 
 Evidence:
 - `results/gate_training_report.json`: `tab_features` length = **160**
-- `models/trance_gate.pkl`: `text_dim = 515`, `tabular_dim = 160`
+- `models/acagn_gate.pkl`: `text_dim = 515`, `tabular_dim = 160`
 
 ---
 
@@ -173,7 +174,7 @@ Evidence:
 - Meta-learner: Logistic Regression (stacking)
 - Calibration: Isotonic Regression fitted on validation → applied to test
 
-Saved in `models/trance_framework.pkl`:
+Saved in `models/acagn_framework.pkl`:
 - `models`: `['lgbm', 'xgb', 'catboost']`
 - `meta`: `LogisticRegression`
 - `calibrator`: isotonic regressor

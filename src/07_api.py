@@ -1,6 +1,6 @@
 # src/07_api.py
 """
-TRANCE Readmission Prediction API — FastAPI v2 compatible.
+ACAGN Readmission Prediction API — FastAPI v2 compatible.
 Run as:  uvicorn src.07_api:app --host 0.0.0.0 --port 8000
       OR python src/07_api.py
 """
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="TRANCE Readmission Prediction API",
+    title="ACAGN Readmission Prediction API",
     description=(
         "30-day hospital readmission risk prediction using "
         "LightGBM + XGBoost ensemble with clinical note embeddings."
