@@ -1,0 +1,64 @@
+digraph G {
+    dpi=300;
+    rankdir=TB;
+    nodesep=0.75;
+    ranksep=0.75;
+    node [shape=box, style="filled,solid", fontname="Arial", fontsize=10, margin="0.2,0.1"];
+    edge [fontname="Arial", fontsize=9, color="#333333"];
+
+    // Inputs
+    {
+        rank=same;
+        InL [label=<<B>x<SUB>structured</SUB></B><BR/><FONT POINT-SIZE="8">160-dim vector</FONT>>, fillcolor="#e6f2ff", color="#0066cc"];
+        InR [label=<<B>e<SUB>text</SUB></B><BR/><FONT POINT-SIZE="8">515-dim vector</FONT>>, fillcolor="#e6ffe6", color="#009933"];
+    }
+
+    // Gate Network Layers
+    G1 [label=<<B>Gate Module Layer 1</B><BR/><FONT POINT-SIZE="8">Linear(515&rarr;256), ReLU</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    G2 [label=<<B>Gate Module Layer 2</B><BR/><FONT POINT-SIZE="8">Linear(256&rarr;160), Sigmoid</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    GV [label=<<B>g &isin; (0,1)<SUP>160</SUP></B><BR/><FONT POINT-SIZE="8">gate vector</FONT>>, fillcolor="#fff0e6", color="#cc5200"];
+
+    // Equation Box
+    EqBox [label=<<B>Gate Equations:</B><BR/><FONT POINT-SIZE="8">g = &sigma;( W<SUB>2</SUB> &middot; ReLU( W<SUB>1</SUB> &middot; e<SUB>text</SUB> ) )<BR/>x<SUB>gated</SUB> = g &#x2299; x<SUB>structured</SUB></FONT>>, shape=note, fillcolor="#ffffe6", color="#cccc00", style="filled,solid"];
+
+    // Interaction Subgraph
+    { 
+        rank=same; 
+        EqBox; 
+        Mult [label="&#x2299;", shape=circle, fontsize=20, width=0.4, fixedsize=true, fillcolor="#ffffff", color="#000000", penwidth=2];
+    }
+
+    xgated [label=<<B>x<SUB>gated</SUB> = g &#x2299; x<SUB>structured</SUB></B><BR/><FONT POINT-SIZE="8">160-dim vector</FONT>>, fillcolor="#f2e6ff", color="#6600cc"];
+
+    Concat [label=<<B>Feature Combination</B><BR/><FONT POINT-SIZE="8">Concatenate &rarr; 675-dim</FONT>>, fillcolor="#f2e6ff", color="#6600cc"];
+
+    // MLP Classifiers
+    FC1 [label=<<B>MLP FC1</B><BR/><FONT POINT-SIZE="8">675&rarr;512, BN, ReLU, Drop 0.3</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    FC2 [label=<<B>MLP FC2</B><BR/><FONT POINT-SIZE="8">512&rarr;256, BN, ReLU, Drop 0.3</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    FC3 [label=<<B>MLP FC3</B><BR/><FONT POINT-SIZE="8">256&rarr;128, ReLU, Drop 0.2</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    OutL [label=<<B>Output Layer</B><BR/><FONT POINT-SIZE="8">128&rarr;1, Sigmoid</FONT>>, fillcolor="#f9f9f9", color="#666666"];
+    
+    Yhat [label=<<B>y&#770;</B><BR/><FONT POINT-SIZE="8">readmission risk</FONT>>, fillcolor="#fff0e6", color="#cc5200"];
+
+    // Connections
+    InR -> G1 [label=" 515-dim text "];
+    G1 -> G2 [label=" 256-dim hidden "];
+    G2 -> GV [label=" 160-dim bounded "];
+
+    InL -> Mult [label=" 160-dim structured "];
+    GV -> Mult [label=" gate weights g "];
+
+    Mult -> xgated [label=" 160-dim element-wise "];
+
+    xgated -> Concat [label=" gated features "];
+    InR -> Concat [label=" e_text bypass "];
+
+    Concat -> FC1 [label=" 675-dim vector "];
+    FC1 -> FC2 [label=" 512-dim output "];
+    FC2 -> FC3 [label=" 256-dim output "];
+    FC3 -> OutL [label=" 128-dim output "];
+    OutL -> Yhat [label=" probability "];
+
+    // Layout hints
+    EqBox -> Mult [style="invis", minlen=0];
+}

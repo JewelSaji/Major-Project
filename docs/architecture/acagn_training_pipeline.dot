@@ -1,0 +1,150 @@
+digraph ACAGN_System_Overview {
+  graph [
+    rankdir=TB,
+    fontsize=12,
+    fontname="Helvetica",
+    labelloc="t",
+    label="Diagram 1 — System Overview (ACAGN pipeline: raw data → outputs)",
+    bgcolor="white",
+    pad=0.25,
+    nodesep=0.45,
+    ranksep=0.6
+  ];
+
+  edge [color="black", arrowsize=0.8, penwidth=1.0, fontname="Helvetica", fontsize=10];
+  node [
+    shape=box,
+    style="filled",
+    color="black",
+    fontname="Helvetica",
+    fontsize=11,
+    margin="0.08,0.06",
+    fixedsize=true,
+    width=3.0,
+    height=0.92
+  ];
+
+  // ── Level 1 — Data Sources ─────────────────────────────────────────────────
+  mimic_struct [
+    fillcolor="#DBEAFE",
+    label=<
+      <B>MIMIC-IV Structured Tables</B><BR/>
+      <FONT POINT-SIZE="10">admissions, labs, vitals</FONT>
+    >
+  ];
+
+  mimic_notes [
+    fillcolor="#DCFCE7",
+    label=<
+      <B>Clinical Notes (MIMIC-IV-Note)</B><BR/>
+      <FONT POINT-SIZE="10">discharge, radiology</FONT>
+    >
+  ];
+
+  // ── Level 2 — Processing ───────────────────────────────────────────────────
+  feat_eng [
+    fillcolor="#DBEAFE",
+    label=<
+      <B>Structured Feature Engineering</B><BR/>
+      <FONT POINT-SIZE="10">675 → 128 (58+70)</FONT>
+    >
+  ];
+
+  ct5_embed [
+    fillcolor="#DCFCE7",
+    label=<
+      <B>ClinicalT5 Embedding</B><BR/>
+      <FONT POINT-SIZE="10">200w + mean pool → 512 + PCA</FONT>
+    >
+  ];
+
+  // ── Level 3 — Two Parallel Paths ───────────────────────────────────────────
+  base [
+    fillcolor="#FFEDD5",
+    label=<
+      <B>ACAGN-Base</B><BR/>
+      <FONT POINT-SIZE="10">LGBM+XGB+Cat + LR + iso</FONT>
+    >
+  ];
+
+  gate [
+    fillcolor="#FFEDD5",
+    style="filled,dashed",
+    penwidth=1.3,
+    xlabel=<
+      <FONT POINT-SIZE="10">Core Contribution</FONT>
+    >,
+    label=<
+      <B>ACAGN-Gate</B><BR/>
+      <FONT POINT-SIZE="10">gates + MLP + isotonic</FONT>
+    >
+  ];
+
+  // ── Level 4 — Combination ──────────────────────────────────────────────────
+  hybrid [
+    fillcolor="#FFEDD5",
+    label=<
+      <B>ACAGN-Hybrid</B><BR/>
+      <FONT POINT-SIZE="10">0.5×Base + 0.5×Gate</FONT>
+    >
+  ];
+
+  // ── Level 5 — Outputs ──────────────────────────────────────────────────────
+  risk_score [
+    fillcolor="#FFEDD5",
+    label=<
+      <B>Risk Score</B><BR/>
+      <FONT POINT-SIZE="10">probability 0–1</FONT>
+    >
+  ];
+
+  threshold_sel [
+    fillcolor="#FFEDD5",
+    label=<
+      <B>Threshold Selection</B><BR/>
+      <FONT POINT-SIZE="10">MCC / F1 / recall</FONT>
+    >
+  ];
+
+  shap [
+    fillcolor="#DBEAFE",
+    label=<
+      <B>SHAP Explanation</B><BR/>
+      <FONT POINT-SIZE="10">tree explanations</FONT>
+    >
+  ];
+
+  gate_expl [
+    fillcolor="#DCFCE7",
+    label=<
+      <B>Gate-Weight Explanation</B><BR/>
+      <FONT POINT-SIZE="10">per-feature gates g</FONT>
+    >
+  ];
+
+  // Rank rows (top to bottom)
+  { rank=same; mimic_struct; mimic_notes; }
+  { rank=same; feat_eng; ct5_embed; }
+  { rank=same; base; gate; }
+  { rank=same; hybrid; }
+  { rank=same; risk_score; threshold_sel; shap; gate_expl; }
+
+  // Downward-only arrows (all labeled)
+  mimic_struct -> feat_eng  [label="raw EHR"];
+  mimic_notes  -> ct5_embed [label="raw notes"];
+
+  feat_eng  -> base [label="128 features"];
+  ct5_embed -> base [label="512-dim vec"];
+
+  feat_eng  -> gate [label="160 features"];
+  ct5_embed -> gate [label="512-dim vec"];
+
+  base -> hybrid [label="calib. prob"];
+  gate -> hybrid [label="calib. prob"];
+
+  hybrid -> risk_score    [label="risk p̂"];
+  hybrid -> threshold_sel [label="operating pt"];
+
+  base -> shap      [label="model + data"];
+  gate -> gate_expl [label="gate weights"];
+}

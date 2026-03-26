@@ -122,6 +122,18 @@ Note on artifacts:
 - Large generated data/model files are typically **not committed to git** (see `.gitignore`), so your workspace may contain
   only the pruned feature file (`data/ultimate_features_pruned.csv`) and the embedding file (`data/embeddings.csv`).
 
+### 3.1 Architecture diagrams (Graphviz)
+
+We provide clean, editable architecture diagrams as Graphviz `.dot` sources:
+- Diagram 1 (System Overview): `docs/architecture/acagn_training_pipeline.dot`
+- Diagram 2 (ACAGN-Gate Detail): `docs/architecture/acagn_inference.dot`
+
+To render (SVG recommended):
+
+```bash
+bash scripts/render_arch_diagrams.sh
+```
+
 ---
 
 ## 4. Inputs and Feature Engineering (What the Models See)
