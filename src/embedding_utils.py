@@ -50,14 +50,14 @@ try:
     from .config import (
         TEXT_MODEL_CANDIDATES, EMBEDDING_DIM, TEXT_MAX_LENGTH,
         BATCH_SIZE_GPU, BATCH_SIZE_CPU, EMBEDDING_INFO_PKL, RANDOM_STATE,
-        MAIN_MODEL_PKL,
+        MAIN_MODEL_PKL, MAIN_MODEL_PKL_LEGACY,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from config import (
         TEXT_MODEL_CANDIDATES, EMBEDDING_DIM, TEXT_MAX_LENGTH,
         BATCH_SIZE_GPU, BATCH_SIZE_CPU, EMBEDDING_INFO_PKL, RANDOM_STATE,
-        MAIN_MODEL_PKL,
+        MAIN_MODEL_PKL, MAIN_MODEL_PKL_LEGACY,
     )
 
 
@@ -85,6 +85,14 @@ def _extract_primary_model(model_data: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 # CLINICAL TEXT UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _intercept_server_path(path):
+    import os
+    if isinstance(path, str) and "/home/csnn04" in path:
+        local_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "clinical_t5_finetuned", "encoder")
+        if os.path.exists(local_path):
+            return local_path
+    return path
 
 class ClinicalNoteChunker:
     """Handles chunking for long clinical notes that exceed model max_length."""
@@ -259,7 +267,8 @@ class EmbeddingGenerator:
             logger.info("Loading T5 model from hub: %s", model_name)
             dtype = torch.float16 if self.device.type == "cuda" else torch.float32
             try:
-                self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                tok_path = model_name.replace("encoder", "adapter") if "encoder" in model_name and os.path.exists(model_name.replace("encoder", "adapter")) else model_name
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(tok_path)
                 self._hf_model = T5EncoderModel.from_pretrained(
                     model_name,
                     torch_dtype=dtype,
@@ -268,7 +277,8 @@ class EmbeddingGenerator:
             except Exception as e:
                 logger.warning("Native T5 load failed, trying from_flax=True: %s", e)
                 try:
-                    self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                    tok_path = model_name.replace("encoder", "adapter") if "encoder" in model_name and os.path.exists(model_name.replace("encoder", "adapter")) else model_name
+                    self._hf_tokenizer = AutoTokenizer.from_pretrained(tok_path)
                     self._hf_model = T5EncoderModel.from_pretrained(
                         model_name,
                         from_flax=True,
@@ -356,6 +366,7 @@ class EmbeddingGenerator:
                     parts = []
                     for m in models:
                         name = m.get("name") if isinstance(m, dict) else m
+                        name = _intercept_server_path(name)
                         mtype = m.get("type") if isinstance(m, dict) else None
                         chunk_vecs = []
                         for chunk in note_chunks:
@@ -366,7 +377,7 @@ class EmbeddingGenerator:
                         parts.append(np.vstack(chunk_vecs).mean(axis=0, keepdims=True))
                     raw_768 = np.hstack(parts)
 
-                if method == "sentence_transformers":
+                elif method == "sentence_transformers":
                     parts = [self._embed_with_st(chunk, model_name) for chunk in note_chunks]
                     raw_768 = np.vstack(parts).mean(axis=0, keepdims=True)
 
@@ -375,6 +386,7 @@ class EmbeddingGenerator:
                     # when ClinicalT5/T5EncoderModel was used during training.
                     # Try converted PyTorch dir first, then generic HuggingFace path.
                     converted_dir = self.model_info.get("converted_dir")
+                    converted_dir = _intercept_server_path(converted_dir)
                     if converted_dir and os.path.exists(converted_dir):
                         parts = [self._embed_with_clinical_t5(chunk, converted_dir) for chunk in note_chunks]
                     else:
@@ -430,10 +442,11 @@ class EmbeddingGenerator:
                             parts.append(self._embed_with_hf("[NO_NOTE]", name))
                     raw_768 = np.hstack(parts)
 
-                if method == "sentence_transformers":
+                elif method == "sentence_transformers":
                     raw_768 = self._embed_with_st("[NO_NOTE]", model_name)
                 elif method in ("clinical_t5", "transformer_t5"):
                     converted_dir = self.model_info.get("converted_dir")
+                    converted_dir = _intercept_server_path(converted_dir)
                     if not converted_dir:
                         local_converted = os.path.join(
                             os.path.dirname(self.model_info_path), "clinical_t5_pytorch"
@@ -532,7 +545,7 @@ def validate_embeddings(embeddings: np.ndarray, target_values=None,
 
 class ModelContainer:
     """
-    Loads and holds the trained readmission model (trance_framework.pkl).
+    Loads and holds the trained readmission model (ACAGN base ensemble).
     Exposes the primary LightGBM model via self.primary_model for SHAP / inference.
     """
 
@@ -544,8 +557,16 @@ class ModelContainer:
 
     def load_model(self):
         if not os.path.exists(self.model_path):
-            logger.error("Model file not found at %s", self.model_path)
-            return
+            if os.path.exists(MAIN_MODEL_PKL_LEGACY):
+                logger.warning(
+                    "Model file not found at %s; falling back to legacy path %s",
+                    self.model_path,
+                    MAIN_MODEL_PKL_LEGACY,
+                )
+                self.model_path = MAIN_MODEL_PKL_LEGACY
+            else:
+                logger.error("Model file not found at %s", self.model_path)
+                return
         try:
             self.model_data = joblib.load(self.model_path)
             self.primary_model = _extract_primary_model(self.model_data)

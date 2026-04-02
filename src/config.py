@@ -29,7 +29,9 @@ FEATURES_CSV = os.path.join(DATA_DIR, "ultimate_features.csv")
 EMBEDDINGS_CSV = os.path.join(DATA_DIR, "embeddings.csv")
 
 # Model Files
-MAIN_MODEL_PKL = os.path.join(MODELS_DIR, "trance_framework.pkl")
+ACAGN_MAIN_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_framework.pkl")
+MAIN_MODEL_PKL = ACAGN_MAIN_MODEL_PKL
+MAIN_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "trance_framework.pkl")
 # EMBEDDING_INFO_PKL = os.path.join(MODELS_DIR, "clinical_t5_info.pkl")
 EMBEDDING_INFO_PKL = os.path.join(MODELS_DIR, "embedding_info.pkl")
 FEATURE_METADATA_JSON = os.path.join(MODELS_DIR, "feature_metadata.json")
@@ -197,6 +199,7 @@ EMBED_FUSION_MODELS = [
 # ========================================
 # Optuna hyperparameter search — more trials → better HPO, slower run.
 TRAIN_OPTUNA_TRIALS      = 50  # was 200; plateaued at 50 in previous run
+TRAIN_OPTUNA_TRIALS      = 100
 
 # DART tree cap (DART has no early stopping, so keep bounded).
 TRAIN_DART_MAX_TREES     = 800
@@ -217,7 +220,7 @@ TRAIN_BLEND_TRIALS       = 1000  # was 500
 
 # How many of the highest-variance ct5_* embedding dimensions to keep.
 # Reduces embedding noise; set to EMBED_DIM to keep all.
-TRAIN_CT5_KEEP_DIMS      = 512
+TRAIN_CT5_KEEP_DIMS      = 256
 
 # Candidate feature-count subsets evaluated during auto feature selection.
 # The one giving highest val AUROC is chosen.
@@ -255,8 +258,16 @@ SHAP_N_SAMPLES = 500
 # 10. GATED FUSION SETTINGS
 # ========================================
 
-# Path for the new gated model
-GATE_MODEL_PKL = os.path.join(MODELS_DIR, "trance_gate.pkl")
+# Path for the gated model bundle used for inference.
+# Keep separate from legacy artifacts to avoid overwriting older gate bundles.
+ACAGN_GATE_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_gate_infer.pkl")
+GATE_MODEL_PKL = ACAGN_GATE_MODEL_PKL
+GATE_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "trance_gate.pkl")
+
+# Concat-MLP baseline (no gating; concatenate text + tabular directly)
+ACAGN_CONCAT_MLP_MODEL_PKL = os.path.join(MODELS_DIR, "acagn_concat_mlp.pkl")
+CONCAT_MLP_MODEL_PKL = ACAGN_CONCAT_MLP_MODEL_PKL
+CONCAT_MLP_MODEL_PKL_LEGACY = os.path.join(MODELS_DIR, "concat_mlp.pkl")
 
 # Gate network architecture
 GATE_HIDDEN_DIM = 128        # hidden layer size inside gate network
@@ -284,6 +295,8 @@ GATE_SHAP_IMPORTANCE_CSV = os.path.join(RESULTS_DIR, "gate_shap_importance.csv")
 GATE_SHAP_SUMMARY_PNG     = os.path.join(FIGURES_DIR, "gate_shap_summary.png")
 EARLY_WARNING_CSV       = os.path.join(RESULTS_DIR, "early_warning_results.csv")
 TEMPORAL_DRIFT_CSV      = os.path.join(RESULTS_DIR, "temporal_drift_results.csv")
+
+CONCAT_MLP_REPORT_JSON  = os.path.join(RESULTS_DIR, "concat_mlp_training_report.json")
 
 # ========================================
 # 12. EARLY WARNING SETTINGS
